@@ -1,0 +1,18 @@
+name = "xero-worker"
+main = "src/index.ts"
+compatibility_date = "2024-11-01"
+
+kv_namespaces = [
+  { binding = "XERO_KV", id = "80171cf870f84f5b866d5e39f597bfa1" }
+]
+
+# Secrets (set via: wrangler secret put XERO_CLIENT_ID etc.)
+# XERO_CLIENT_ID
+# XERO_CLIENT_SECRET
+# XERO_REDIRECT_URI
+#
+# Xero app scopes required (set in developer.xero.com):
+# openid profile email offline_access
+# accounting.invoices accounting.payments
+# accounting.banktransactions accounting.manualjournals
+# accounting.settings accounting.reports.read

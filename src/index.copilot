@@ -1,0 +1,263 @@
+
+
+
+export interface Env {
+  XERO_CLIENT_ID: string;
+  XERO_CLIENT_SECRET: string;
+  XERO_REDIRECT_URI: string;
+  XERO_KV: KVNamespace;
+}
+
+const XERO_AUTH_URL = "https://login.xero.com/identity/connect/authorize";
+const XERO_TOKEN_URL = "https://identity.xero.com/connect/token";
+const XERO_API_BASE = "https://api.xero.com/api.xro/2.0";
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+    const path = url.pathname.toLowerCase().replace(/\/+$/, ""); 
+    // normalises:
+    // /auth        → /auth
+    // /auth/       → /auth
+    // /auth///     → /auth
+    // /AUTH/       → /auth
+
+    console.log("NORMALISED PATH:", path);
+
+    // --- CALLBACK FIRST (more specific) ---
+    if (path === "/auth/callback") {
+      return handleCallback(url, env);
+    }
+
+    // --- AUTH START ---
+    if (path === "/auth") {
+      return redirectToXero(env);
+    }
+
+    // --- API ROUTES ---
+    if (path === "/api/invoices") {
+      return callXeroAPI(env, "/Invoices");
+    }
+
+    if (path === "/cashflow") {
+      return handleCashflow(env);
+    }
+
+    // --- DEFAULT ---
+    return new Response("Xero Worker is running.");
+  },
+};
+
+function redirectToXero(env: Env): Response {
+  const params = new URLSearchParams({
+    response_type: "code",
+	 response_mode: "query",
+    client_id: env.XERO_CLIENT_ID,
+    redirect_uri: env.XERO_REDIRECT_URI,
+    scope: [
+      "openid",
+      "profile",
+      "email",
+      "offline_access",
+      "accounting.invoices",
+      "accounting.payments",
+      "accounting.banktransactions",
+      "accounting.manualjournals",
+      "accounting.settings"
+    ].join(" "),
+  });
+
+  return Response.redirect(`${XERO_AUTH_URL}?${params.toString()}`, 302);
+}
+
+async function handleCallback(url: URL, env: Env): Promise<Response> {
+  console.log("CALLBACK HIT:", url.toString());
+
+  const code = url.searchParams.get("code");
+  if (!code) return new Response("Missing code", { status: 400 });
+  const tokenData = await exchangeCodeForToken(code, env);
+
+  // Add expires_at
+  tokenData.expires_at = Date.now() + tokenData.expires_in * 1000;
+
+  // Fetch tenant ID
+  const connectionsRes = await fetch("https://api.xero.com/connections", {
+    headers: {
+      Authorization: `Bearer ${tokenData.access_token}`
+    }
+  });
+
+  if (!connectionsRes.ok) {
+    const errorText = await connectionsRes.text();
+    return new Response("Failed to fetch connections: " + errorText, { status: 500 });
+  }
+
+  const connections = await connectionsRes.json();
+
+  if (!Array.isArray(connections) || connections.length === 0) {
+    return new Response("No Xero tenants found", { status: 500 });
+  }
+
+  tokenData.tenant_id = connections[0].tenantId;
+
+  // Store everything
+ tokenData.created_at = Date.now();
+
+await env.XERO_KV.put("xero_tokens", JSON.stringify(tokenData));
+
+  return new Response("Xero connected successfully! You can close this window.");
+}
+
+async function exchangeCodeForToken(code: string, env: Env) {
+  const body = new URLSearchParams({
+    grant_type: "authorization_code",
+    code,
+    redirect_uri: env.XERO_REDIRECT_URI,
+    client_id: env.XERO_CLIENT_ID,
+    client_secret: env.XERO_CLIENT_SECRET,
+  });
+
+  const res = await fetch(XERO_TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+
+  return res.json();
+}
+
+async function refreshToken(env: Env) {
+  const stored = await env.XERO_KV.get("xero_tokens", "json");
+  if (!stored?.refresh_token) throw new Error("No refresh token stored");
+
+  const body = new URLSearchParams({
+    grant_type: "refresh_token",
+    refresh_token: stored.refresh_token,
+    client_id: env.XERO_CLIENT_ID,
+    client_secret: env.XERO_CLIENT_SECRET,
+  });
+
+  const res = await fetch(XERO_TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+
+  const newTokens = await res.json();
+  await env.XERO_KV.put("xero_tokens", JSON.stringify(newTokens));
+
+  return newTokens;
+}
+
+async function callXeroAPI(env: Env, endpoint: string) {
+  let tokens = await env.XERO_KV.get("xero_tokens", "json");
+  if (!tokens) return new Response("Not authenticated with Xero", { status: 401 });
+
+  // Refresh if expired
+  if (Date.now() > tokens.expires_at) {
+
+    tokens = await refreshToken(env);
+  }
+
+  const res = await fetch(`${XERO_API_BASE}${endpoint}`, {
+    headers: {
+      Authorization: `Bearer ${tokens.access_token}`,
+      "Xero-tenant-id": tokens.tenant_id,
+    },
+  });
+
+  return new Response(await res.text(), {
+    headers: { "Content-Type": "application/json" }
+  });
+}
+
+async function refreshXeroToken(env: Env, refresh_token: string) {
+  const body = new URLSearchParams({
+    grant_type: "refresh_token",
+    refresh_token,
+    client_id: env.XERO_CLIENT_ID,
+    client_secret: env.XERO_CLIENT_SECRET
+  });
+
+  const res = await fetch("https://identity.xero.com/connect/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body
+  });
+
+  const json = await res.json();
+
+  return {
+    access_token: json.access_token,
+    refresh_token: json.refresh_token,
+    expires_at: Date.now() + json.expires_in * 1000
+  };
+}
+
+async function handleCashflow(env: Env) {
+  // Load token from KV
+  const tokenData = await env.XERO_KV.get("xero_tokens", "json");
+  if (!tokenData) {
+    return new Response("Not authenticated with Xero", { status: 401 });
+  }
+
+  let { access_token, refresh_token, expires_at, tenant_id } = tokenData;
+
+  // Refresh token if expired
+  if (Date.now() > expires_at) {
+    const refreshed = await refreshXeroToken(env, refresh_token);
+    access_token = refreshed.access_token;
+    refresh_token = refreshed.refresh_token;
+    expires_at = refreshed.expires_at;
+
+    await env.XERO_KV.put("xero_tokens", JSON.stringify({
+      access_token,
+      refresh_token,
+      expires_at,
+      tenant_id
+    }));
+  }
+
+  // Fetch bank transactions
+  const res = await fetch(
+    "https://api.xero.com/api.xro/2.0/BankTransactions",
+    {
+      headers: {
+        Authorization: `Bearer ${access_token}`,
+        "Xero-tenant-id": tenant_id,
+        Accept: "application/json"
+      }
+    }
+  );
+
+  if (!res.ok) {
+    return new Response("Failed to fetch bank transactions", { status: 500 });
+  }
+
+  const data = await res.json();
+  const transactions = data.BankTransactions || [];
+
+  // Build monthly cashflow summary
+  const monthly: Record<string, { inflow: number; outflow: number; net: number }> = {};
+
+  for (const tx of transactions) {
+    const date = tx.Date?.substring(0, 7); // YYYY-MM
+    if (!date) continue;
+
+    if (!monthly[date]) {
+      monthly[date] = { inflow: 0, outflow: 0, net: 0 };
+    }
+
+    const amount = tx.Total || 0;
+
+    if (tx.Type === "RECEIVE" || tx.Type === "RECEIVE-OVERPAYMENT") {
+      monthly[date].inflow += amount;
+    } else if (tx.Type === "SPEND" || tx.Type === "SPEND-OVERPAYMENT") {
+      monthly[date].outflow += amount;
+    }
+
+    monthly[date].net = monthly[date].inflow - monthly[date].outflow;
+  }
+
+  return Response.json(monthly);
+}
