@@ -14,11 +14,273 @@ interface XeroTokens {
   created_at?: number;
 }
 
+interface CostSettings {
+  basePostcode: string;
+  hourlyRate: number;
+  mileageRatePerMile: number;
+  hotelThresholdMiles: number;
+  hotelNightlyCost: number;
+  subsistenceDailyRate: number;
+  drivingSpeedMph: number;
+  setupHours: Record<string, number>;   // keyed by resource type prefix, e.g. "Day Van" → 1
+  contingencyHours: number;
+  payeMode: boolean;
+  payeOnCostMultiplier: number;
+}
+
+interface EventCosts {
+  wages: number;
+  mileage: number;
+  hotel: number;
+  subsistence: number;
+  total: number;
+  staffCount: number;
+  operationalHours: number;
+  drivingHours: number;
+  setupHours: number;
+  totalPaidHours: number;
+  miles: number;
+  nights: number;
+  payeMode: boolean;
+  breakdown: string;
+}
+
+interface PipelineItem {
+  id: string;
+  name: string;
+  status: string;
+  eventStart: string;
+  eventEnd: string;
+  eventDays: number;
+  paymentDate: string;
+  price: number;
+  priceFlag: string;
+  rawPrice: string | null;
+  unitCount: number;
+  resourceTypes: string[];   // names of active Mobiloo resources, e.g. ["Day Van (Adam)", "Trailer (Holly)"]
+  address: string | null;
+  operationalHours: number | null;
+  costs: EventCosts;
+}
+
+const DEFAULT_COST_SETTINGS: CostSettings = {
+  basePostcode:          "GL10 3RF",
+  hourlyRate:            12.50,
+  mileageRatePerMile:    0.45,
+  hotelThresholdMiles:   50,
+  hotelNightlyCost:      80,
+  subsistenceDailyRate:  5,
+  drivingSpeedMph:       40,
+  setupHours:            { "Day Van": 1, "Trailer": 4, "POD": 4 },
+  contingencyHours:      1,
+  payeMode:              false,
+  payeOnCostMultiplier:  1.258,   // employer NI 13.8% + holiday pay 12.07%
+};
+
 const XERO_AUTH_URL  = "https://login.xero.com/identity/connect/authorize";
 const XERO_TOKEN_URL = "https://identity.xero.com/connect/token";
 const XERO_API_BASE  = "https://api.xero.com/api.xro/2.0";
 const SP_API_BASE    = "https://api.sonderplan.com/v2";
+const MOBILOO_PARENT_ID = 23814;
 
+// ─── In-memory geocode cache ──────────────────────────────────────────────────
+const geocodeCache = new Map<string, { lat: number; lng: number } | null>();
+
+async function geocodePostcode(postcode: string): Promise<{ lat: number; lng: number } | null> {
+  const key = postcode.trim().toUpperCase().replace(/\s+/g, "");
+  if (geocodeCache.has(key)) return geocodeCache.get(key)!;
+  try {
+    const res = await fetch(`https://api.postcodes.io/postcodes/${encodeURIComponent(key)}`);
+    if (!res.ok) { geocodeCache.set(key, null); return null; }
+    const data: any = await res.json();
+    if (data.status !== 200 || !data.result) { geocodeCache.set(key, null); return null; }
+    const result = { lat: data.result.latitude, lng: data.result.longitude };
+    geocodeCache.set(key, result);
+    return result;
+  } catch {
+    geocodeCache.set(key, null);
+    return null;
+  }
+}
+
+function haversineKm(a: { lat: number; lng: number }, b: { lat: number; lng: number }): number {
+  const R = 6371;
+  const dLat = (b.lat - a.lat) * Math.PI / 180;
+  const dLng = (b.lng - a.lng) * Math.PI / 180;
+  const x = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * Math.PI / 180) * Math.cos(b.lat * Math.PI / 180) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x));
+}
+
+function kmToMiles(km: number): number { return km * 0.621371; }
+
+// Extract the first UK-looking postcode from a freetext address
+function extractPostcode(address: string): string | null {
+  const match = address.match(/\b([A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2})\b/i);
+  return match ? match[1].trim() : null;
+}
+
+// Parse "10 hours", "10h", "10:00", "8-10" → decimal hours
+function parseOperationalHours(raw: string | null): number | null {
+  if (!raw) return null;
+  const cleaned = raw.trim().toLowerCase();
+  // Range like "8-10" → take the upper end
+  const rangeMatch = cleaned.match(/^(\d+(?:\.\d+)?)\s*[-–to]+\s*(\d+(?:\.\d+)?)/);
+  if (rangeMatch) return parseFloat(rangeMatch[2]);
+  // HH:MM
+  const timeMatch = cleaned.match(/^(\d+):(\d{2})/);
+  if (timeMatch) return parseInt(timeMatch[1]) + parseInt(timeMatch[2]) / 60;
+  // Plain number with optional unit
+  const numMatch = cleaned.match(/^(\d+(?:\.\d+)?)/);
+  if (numMatch) return parseFloat(numMatch[1]);
+  return null;
+}
+
+// "Van (Adam), DayVan (Holly)" → 2; also handles plain number strings
+function countUnitsFromEquipment(raw: string | null, fallbackUnitCount: number): number {
+  if (!raw) return fallbackUnitCount;
+  const trimmed = raw.trim();
+  // Plain integer string like "2"
+  if (/^\d+$/.test(trimmed)) return parseInt(trimmed);
+  // Count comma/semicolon-separated items
+  const parts = trimmed.split(/[,;]+/).filter(s => s.trim().length > 0);
+  return parts.length > 0 ? parts.length : fallbackUnitCount;
+}
+
+// Resolve setup hours for a list of resource names using the setupHours map.
+// Matches by prefix, case-insensitive. Sums across all units.
+// e.g. ["Day Van (Adam)", "Trailer (Holly)"] → 1 + 4 = 5h
+function resolveSetupHours(resourceNames: string[], setupMap: Record<string, number>, contingency: number): number {
+  let total = 0;
+  for (const name of resourceNames) {
+    const upper = name.trim().toUpperCase();
+    let matched = false;
+    for (const [key, hrs] of Object.entries(setupMap)) {
+      if (upper.startsWith(key.toUpperCase())) {
+        total += hrs;
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) total += 1; // safe fallback for unrecognised resource type
+  }
+  return total + contingency; // contingency applied once per event
+}
+
+async function estimateEventCosts(
+  address: string | null,
+  unitCount: number,
+  resourceNames: string[],
+  operationalHours: number | null,
+  eventDays: number,
+  settings: CostSettings
+): Promise<EventCosts> {
+  // 1 staff per unit (self-employed drivers paid for working hours only)
+  const staffCount = unitCount;
+
+  // Mileage distance (one-way)
+  let miles = 0;
+  if (address) {
+    const pc = extractPostcode(address);
+    if (pc) {
+      const [baseCoord, eventCoord] = await Promise.all([
+        geocodePostcode(settings.basePostcode),
+        geocodePostcode(pc),
+      ]);
+      if (baseCoord && eventCoord) {
+        miles = kmToMiles(haversineKm(baseCoord, eventCoord));
+      }
+    }
+  }
+
+  // Driving hours: return trip at configured speed, per unit (each drives separately)
+  const drivingHoursPerUnit = miles > 0 ? (miles * 2) / settings.drivingSpeedMph : 0;
+  const totalDrivingHours   = drivingHoursPerUnit * unitCount;
+
+  // Setup/breakdown hours from resource types + contingency
+  const setupHrs = resolveSetupHours(resourceNames, settings.setupHours, settings.contingencyHours);
+
+  // Operational hours: use field value if available, otherwise fallback per day
+  const opHours     = operationalHours ?? (eventDays >= 3 ? 10 : 8) * eventDays;
+  const totalPaidHours = opHours + totalDrivingHours + setupHrs;
+
+  // Wages — PAYE multiplier applied globally if payeMode is on
+  const wageMultiplier = settings.payeMode ? settings.payeOnCostMultiplier : 1;
+  const wages = staffCount * totalPaidHours * settings.hourlyRate * wageMultiplier;
+
+  // Mileage cost: return trip × units
+  const mileage = miles * 2 * unitCount * settings.mileageRatePerMile;
+
+  // Hotel: multi-day events, or if distance > threshold
+  const needsHotel = eventDays > 1 || miles > settings.hotelThresholdMiles;
+  const nights     = needsHotel ? Math.max(eventDays - 1, 1) : 0;
+  const hotel      = nights * staffCount * settings.hotelNightlyCost;
+
+  // Subsistence
+  const subsistenceDays = eventDays + (miles > settings.hotelThresholdMiles ? 1 : 0);
+  const subsistence     = subsistenceDays * staffCount * settings.subsistenceDailyRate;
+
+  const total = wages + mileage + hotel + subsistence;
+
+  const payeNote = settings.payeMode ? ` ×${settings.payeOnCostMultiplier} PAYE` : "";
+  const breakdown = [
+    `${staffCount} staff × ${totalPaidHours.toFixed(1)}h${payeNote} = ${fmtGBP(wages)} wages`,
+    `  (${opHours.toFixed(1)}h ops + ${totalDrivingHours.toFixed(1)}h driving + ${setupHrs.toFixed(1)}h setup/contingency)`,
+    miles > 0
+      ? `${Math.round(miles)}mi × 2 × ${unitCount} units = ${fmtGBP(mileage)} mileage`
+      : "no mileage (no postcode)",
+    nights > 0 ? `${nights} night(s) = ${fmtGBP(hotel)} hotel` : "no hotel",
+    `${subsistenceDays}d subsistence = ${fmtGBP(subsistence)}`,
+  ].join(" • ");
+
+  return {
+    wages, mileage, hotel, subsistence, total,
+    staffCount,
+    operationalHours: opHours,
+    drivingHours:     totalDrivingHours,
+    setupHours:       setupHrs,
+    totalPaidHours,
+    miles:            Math.round(miles),
+    nights,
+    payeMode:         settings.payeMode,
+    breakdown,
+  };
+}
+
+function fmtGBP(n: number): string {
+  return "£" + n.toFixed(0);
+}
+
+// ─── KV settings helpers ──────────────────────────────────────────────────────
+async function getCostSettings(env: Env): Promise<CostSettings> {
+  try {
+    const stored = await env.XERO_KV.get("cost_settings", "json") as Partial<CostSettings> | null;
+    if (!stored) return { ...DEFAULT_COST_SETTINGS };
+    return { ...DEFAULT_COST_SETTINGS, ...stored };
+  } catch {
+    return { ...DEFAULT_COST_SETTINGS };
+  }
+}
+
+async function handleSettingsGet(env: Env): Promise<Response> {
+  const settings = await getCostSettings(env);
+  return Response.json(settings, { headers: { "Access-Control-Allow-Origin": "*" } });
+}
+
+async function handleSettingsPost(request: Request, env: Env): Promise<Response> {
+  try {
+    const body = await request.json() as Partial<CostSettings>;
+    const current = await getCostSettings(env);
+    const updated: CostSettings = { ...current, ...body };
+    await env.XERO_KV.put("cost_settings", JSON.stringify(updated));
+    // Clear geocode cache when base postcode changes
+    geocodeCache.clear();
+    return Response.json({ ok: true, settings: updated }, { headers: { "Access-Control-Allow-Origin": "*" } });
+  } catch (e: any) {
+    return new Response("Bad request: " + e.message, { status: 400 });
+  }
+}
+
+// ─── Utilities ────────────────────────────────────────────────────────────────
 function parseXeroDate(val: string | undefined | null): string | null {
   if (!val) return null;
   const match = val.match(/\/Date\((\d+)/);
@@ -68,16 +330,15 @@ function parseQuotedPrice(raw: string | null): { price: number | null; flag: str
   return { price: null, flag: "Complex" };
 }
 
-// ─── Sonderplan fetch ─────────────────────────────────────────────────────────
-// Key fixes:
-// 1. Uses date filter to only fetch current year
-// 2. Groups all resource rows by booking ID first, then picks status from
-//    whichever row has it (only parent rows carry status)
-// 3. Only includes Confirmed and Provisional statuses
-
-async function fetchSonderplanPipeline(token: string, fromTime: number, toTime: number): Promise<any[]> {
+// ─── Sonderplan pipeline fetch ────────────────────────────────────────────────
+async function fetchSonderplanPipeline(
+  token: string,
+  fromTime: number,
+  toTime: number,
+  costSettings: CostSettings
+): Promise<PipelineItem[]> {
   const PIPELINE_STATUSES = new Set(["Confirmed", "Provisional"]);
-  const EXCLUDED_STATUSES = new Set(["Cancelled","Passed on","Unavailable","Waiting List","Set up/ Pack down/Travel"]);
+  const EXCLUDED_STATUSES = new Set(["Cancelled", "Passed on", "Unavailable", "Waiting List", "Set up/ Pack down/Travel"]);
 
   const headers = {
     Authorization:  `Bearer ${token}`,
@@ -85,17 +346,18 @@ async function fetchSonderplanPipeline(token: string, fromTime: number, toTime: 
     "Content-Type": "application/json",
   };
 
+  // Always fetch from start of current year so past confirmed/provisional events are included
+  const yearStart = new Date(new Date().getFullYear(), 0, 1);
+  const effectiveFrom = Math.min(fromTime, Math.floor(yearStart.getTime() / 1000));
+
   let allRows: any[] = [];
   let page = 1;
   let totalPages = 1;
 
   do {
-    const url = `${SP_API_BASE}/booking?page=${page}&limit=25&from_time=${fromTime}&to_time=${toTime}&resource_parent=true`;
+    const url = `${SP_API_BASE}/booking?page=${page}&limit=25&from_time=${effectiveFrom}&to_time=${toTime}&resource_parent=true`;
     const res = await fetch(url, { method: "GET", headers });
-    if (!res.ok) {
-      console.error("Sonderplan fetch failed:", res.status, await res.text());
-      break;
-    }
+    if (!res.ok) { console.error("SP fetch failed:", res.status); break; }
     const json: any = await res.json();
     if (page === 1) totalPages = json.meta?.pagination?.total_pages || 1;
     if (!json.data || json.data.length === 0) break;
@@ -103,13 +365,17 @@ async function fetchSonderplanPipeline(token: string, fromTime: number, toTime: 
     page++;
   } while (page <= totalPages);
 
-  // Deduplicate on name + start date — this is the true unique key for an event.
-  // Multiple rows can exist for the same event (one per vehicle/unit assigned).
-  // We take the first row that has a usable status and price.
   const seen = new Set<string>();
-  const pipeline: any[] = [];
+  const pipeline: PipelineItem[] = [];
 
-  const MOBILOO_PARENT_ID = 23814; // Mobiloos parent class in Sonderplan
+  // Helper: case-insensitive custom field lookup with fallback names
+  const getField = (customFields: any[], ...names: string[]): string | null => {
+    for (const name of names) {
+      const f = customFields.find((cf: any) => cf.name?.toLowerCase() === name.toLowerCase());
+      if (f?.value) return f.value;
+    }
+    return null;
+  };
 
   for (const row of allRows) {
     if (row.deleted) continue;
@@ -118,79 +384,100 @@ async function fetchSonderplanPipeline(token: string, fromTime: number, toTime: 
     if (!status || !PIPELINE_STATUSES.has(status)) continue;
     if (EXCLUDED_STATUSES.has(status)) continue;
 
-    // Only include bookings that have at least one active Mobiloo unit
-    // parent_id 23814 = Mobiloos. If all resources are deleted = cancelled event.
-    const resources = row.resources || [];
-    const activeResources = resources.filter((r: any) => !r.deleted);
-    const hasMobiloo = activeResources.some((r: any) => r.parent_id === MOBILOO_PARENT_ID);
-    if (!hasMobiloo) continue;
+    const resources    = row.resources || [];
+    const activeRes    = resources.filter((r: any) => !r.deleted);
+    const mobilooRes   = activeRes.filter((r: any) => r.parent_id === MOBILOO_PARENT_ID);
+    if (mobilooRes.length === 0) continue;
 
-    // Dedup key: event name + start timestamp
     const dedupKey = `${row.name}__${row.start}`;
     if (seen.has(dedupKey)) continue;
     seen.add(dedupKey);
 
-    const getField = (name: string) => {
-      const f = (row.custom_fields || []).find((cf: any) => cf.name === name);
-      return f?.value || null;
-    };
-
-    const rawPrice = getField("Quoted Price");
+    const cf = row.custom_fields || [];
+    const rawPrice = getField(cf, "Quoted Price");
     const parsed   = parseQuotedPrice(rawPrice);
-
-    // Skip unparseable or zero/no-quote prices — not useful for forecasting
     if (parsed.flag === "Complex" || parsed.flag === "No Quote") continue;
     if (parsed.price === null || parsed.price === 0) continue;
 
     const eventStart = row.start ? new Date(row.start * 1000) : null;
     if (!eventStart) continue;
+    // No date filter here — we include all Confirmed/Provisional from year start to forecast end
 
-    // Only include events within the requested date window
-    const eventTs = eventStart.getTime() / 1000;
-    if (eventTs < fromTime || eventTs > toTime) continue;
+    const eventEnd  = row.end ? new Date(row.end * 1000) : eventStart;
+    const rawDays   = Math.round((eventEnd.getTime() - eventStart.getTime()) / 86400000);
+    const eventDays = Math.max(rawDays, 1);
 
-    // Expected payment = 1 month before event
+    // Custom fields — try multiple plausible names for each
+    const addressRaw    = getField(cf, "Address", "Venue Address", "Event Address", "Location");
+    const equipmentRaw  = getField(cf, "Equipment", "Resources", "Units", "Vehicles");
+    const opHoursRaw    = getField(cf, "Operational Hours", "Op Hours", "Hours", "Event Hours");
+
+    const unitCount        = countUnitsFromEquipment(equipmentRaw, mobilooRes.length);
+    const operationalHours = parseOperationalHours(opHoursRaw);
+
+    // Resource type names for setup hour lookup — use Sonderplan resource names directly
+    const resourceTypeNames: string[] = mobilooRes.map((r: any) => (r.name || "").trim()).filter(Boolean);
+
+    const costs = await estimateEventCosts(addressRaw, unitCount, resourceTypeNames, operationalHours, eventDays, costSettings);
+
     const paymentDate = new Date(eventStart);
     paymentDate.setMonth(paymentDate.getMonth() - 1);
-
-    // Skip if payment date is already in the past
-    if (paymentDate.getTime() < Date.now()) continue;
+    // Note: we no longer skip past payment dates — all Confirmed/Provisional events are returned
+    // so that the full year view works. The forecast weekly buckets handle future bucketing.
 
     pipeline.push({
-      id:          `${row.id}`,
-      name:        row.name,
+      id:              `${row.id}`,
+      name:            row.name,
       status,
-      eventStart:  toISO(eventStart),
-      paymentDate: toISO(paymentDate),
-      price:       parsed.price,
-      priceFlag:   parsed.flag,
+      eventStart:      toISO(eventStart),
+      eventEnd:        toISO(eventEnd),
+      eventDays,
+      paymentDate:     toISO(paymentDate),
+      price:           parsed.price,
+      priceFlag:       parsed.flag,
       rawPrice,
+      unitCount,
+      resourceTypes:   resourceTypeNames,
+      address:         addressRaw,
+      operationalHours,
+      costs,
     });
   }
 
   return pipeline;
 }
 
+// ─── Router ───────────────────────────────────────────────────────────────────
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url  = new URL(request.url);
     const path = url.pathname.toLowerCase().replace(/\/+$/, "");
+    const method = request.method.toUpperCase();
+
     if (path === "/auth/callback")         return handleCallback(url, env);
     if (path === "/auth")                  return redirectToXero(env);
     if (path === "/dashboard")             return serveDashboard();
     if (path === "/forecast")              return serveForecast();
+    if (path === "/settings")              return serveSettings();
     if (path === "/api/cashflow")          return handleCashflow(env);
     if (path === "/api/invoices")          return callXeroAPI(env, '/Invoices?where=Status%3D%3D%22AUTHORISED%22&order=DueDate+ASC');
     if (path === "/api/invoices-by-month") return handleInvoicesByMonth(env);
     if (path === "/api/cashburn")          return handleCashBurn(env);
+    if (path === "/api/bankbalance")       return handleBankBalance(env);
     if (path === "/api/pnl")               return handleProfitAndLoss(env);
     if (path === "/api/forecast")          return handleForecast(env);
     if (path === "/api/pipeline")          return handlePipeline(env);
     if (path === "/api/sp-debug")          return handleSpDebug(env);
+    if (path === "/api/settings") {
+      if (method === "GET")  return handleSettingsGet(env);
+      if (method === "POST") return handleSettingsPost(request, env);
+      return new Response("Method not allowed", { status: 405 });
+    }
     return new Response("Xero Worker running. Visit /dashboard or /forecast");
   },
 };
 
+// ─── Xero auth ────────────────────────────────────────────────────────────────
 function redirectToXero(env: Env): Response {
   const params = new URLSearchParams({
     response_type: "code", response_mode: "query", client_id: env.XERO_CLIENT_ID,
@@ -257,13 +544,15 @@ async function callXeroAPI(env: Env, endpoint: string): Promise<Response> {
     headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
 }
 
+// ─── API handlers ─────────────────────────────────────────────────────────────
 async function handlePipeline(env: Env): Promise<Response> {
   if (!env.SONDERPLAN_TOKEN) return new Response("SONDERPLAN_TOKEN not configured", { status: 500 });
   const now      = new Date();
   const fromTime = Math.floor(now.getTime() / 1000);
   const toTime   = Math.floor(addDays(now, 34 * 7).getTime() / 1000);
+  const settings = await getCostSettings(env);
   try {
-    const pipeline = await fetchSonderplanPipeline(env.SONDERPLAN_TOKEN, fromTime, toTime);
+    const pipeline = await fetchSonderplanPipeline(env.SONDERPLAN_TOKEN, fromTime, toTime, settings);
     return Response.json({ pipeline, count: pipeline.length }, { headers: { "Access-Control-Allow-Origin": "*" } });
   } catch (e: any) { return new Response("Sonderplan error: " + e.message, { status: 500 }); }
 }
@@ -279,9 +568,9 @@ async function handleSpDebug(env: Env): Promise<Response> {
   const now      = new Date();
   const fromTime = Math.floor(now.getTime() / 1000);
   const toTime   = Math.floor(addDays(now, 34 * 7).getTime() / 1000);
-  const url = `${SP_API_BASE}/booking?page=1&limit=5&from_time=${fromTime}&to_time=${toTime}`;
+  const url      = `${SP_API_BASE}/booking?page=1&limit=5&from_time=${fromTime}&to_time=${toTime}`;
 
-  const res = await fetch(url, {
+  const res      = await fetch(url, {
     method: "GET",
     headers: { Authorization: `Bearer ${env.SONDERPLAN_TOKEN}`, Accept: "application/json", "Content-Type": "application/json" },
   });
@@ -289,19 +578,26 @@ async function handleSpDebug(env: Env): Promise<Response> {
   const httpStatus = res.status;
   const rawText    = await res.text();
   let parsed: any  = null;
-  try { parsed = JSON.parse(rawText); } catch(e) {}
+  try { parsed = JSON.parse(rawText); } catch {}
 
-  // Also run full pipeline fetch to show what we'd actually use
-  let pipelinePreview: any[] = [];
-  try {
-    pipelinePreview = await fetchSonderplanPipeline(env.SONDERPLAN_TOKEN, fromTime, toTime);
-  } catch(e) {}
+  // Collect every custom field name seen on page 1 — tells us the exact field names to use
+  const customFieldNamesSeen = new Set<string>();
+  for (const row of (parsed?.data || [])) {
+    for (const cf of (row.custom_fields || [])) {
+      if (cf.name) customFieldNamesSeen.add(cf.name);
+    }
+  }
+
+  const settings = await getCostSettings(env);
+  let pipelinePreview: PipelineItem[] = [];
+  try { pipelinePreview = await fetchSonderplanPipeline(env.SONDERPLAN_TOKEN, fromTime, toTime, settings); } catch {}
 
   return Response.json({
-    tokenCheck, httpStatus,
+    tokenCheck, httpStatus, settings,
     rawTextPreview: rawText.substring(0, 800),
     meta: parsed?.meta || null,
     total_rows_page1: parsed?.data?.length || 0,
+    custom_field_names_seen: Array.from(customFieldNamesSeen),
     first_booking: parsed?.data?.[0] ? {
       id:            parsed.data[0].id,
       name:          parsed.data[0].name,
@@ -309,16 +605,13 @@ async function handleSpDebug(env: Env): Promise<Response> {
       status_raw:    parsed.data[0].status,
       custom_fields: parsed.data[0].custom_fields,
     } : null,
-    all_statuses_page1: (parsed?.data || []).map((b: any) => ({
-      id: b.id, name: b.name,
-      status: b.status?.[0]?.name || "(no status on this row)",
-      start_date: b.start ? new Date(b.start * 1000).toISOString().substring(0,10) : null,
-    })),
     pipeline_after_filter: {
       count: pipelinePreview.length,
       items: pipelinePreview.slice(0, 5).map(p => ({
-        name: p.name, status: p.status, eventStart: p.eventStart,
-        paymentDate: p.paymentDate, price: p.price, priceFlag: p.priceFlag,
+        name: p.name, status: p.status, eventStart: p.eventStart, eventEnd: p.eventEnd,
+        eventDays: p.eventDays, unitCount: p.unitCount, address: p.address,
+        operationalHours: p.operationalHours, costs: p.costs,
+        price: p.price, priceFlag: p.priceFlag,
       })),
     },
   }, { headers: { "Access-Control-Allow-Origin": "*" } });
@@ -328,118 +621,240 @@ async function handleForecast(env: Env): Promise<Response> {
   let tokens: XeroTokens;
   try { tokens = await getValidTokens(env); } catch (e: any) { return new Response(e.message, { status: 401 }); }
   const h = { Authorization: `Bearer ${tokens.access_token}`, "Xero-tenant-id": tokens.tenant_id, Accept: "application/json" };
-  const weekStart = startOfThisWeek();
-  const weekEnd   = addDays(weekStart, 34 * 7 - 1); // 34-week / ~8-month rolling forecast
-  // Sonderplan: fetch events within the 7-month forecast window
+
+  const weekStart  = startOfThisWeek();
+  const weekEnd    = addDays(weekStart, 34 * 7 - 1);
   const spFromTime = Math.floor(weekStart.getTime() / 1000);
   const spToTime   = Math.floor(weekEnd.getTime() / 1000);
+  const settings   = await getCostSettings(env);
 
   const [invRes, billRes, txRes, spPipeline] = await Promise.all([
     fetch(`${XERO_API_BASE}/Invoices?where=Status%3D%3D%22AUTHORISED%22%26%26Type%3D%3D%22ACCREC%22`, { headers: h }),
     fetch(`${XERO_API_BASE}/Invoices?where=Status%3D%3D%22AUTHORISED%22%26%26Type%3D%3D%22ACCPAY%22`, { headers: h }),
     fetch(`${XERO_API_BASE}/BankTransactions`, { headers: h }),
     env.SONDERPLAN_TOKEN
-      ? fetchSonderplanPipeline(env.SONDERPLAN_TOKEN, spFromTime, spToTime).catch(() => [])
+      ? fetchSonderplanPipeline(env.SONDERPLAN_TOKEN, spFromTime, spToTime, settings).catch(() => [])
       : Promise.resolve([]),
   ]);
 
-  const [invData, billData, txData] = await Promise.all([invRes.json() as any, billRes.json() as any, txRes.json() as any]);
+  const [invData, billData, txData] = await Promise.all([
+    invRes.json() as any, billRes.json() as any, txRes.json() as any,
+  ]);
 
-  interface LineItem { ref: string; contact: string; amount: number; due: string; type: string; source: "xero"|"sonderplan"; status?: string; priceFlag?: string; }
-  interface WeekBucket { weekStart: string; weekEnd: string; label: string; inflows: LineItem[]; outflows: LineItem[];
-    totalIn: number; totalOut: number; confirmedIn: number; pipelineIn: number; net: number; runningBalance: number; }
+  interface LineItem {
+    ref: string; contact: string; amount: number; due: string; type: string;
+    source: "xero" | "sonderplan" | "staff-estimate";
+    status?: string; priceFlag?: string;
+    unitCount?: number; eventDays?: number; miles?: number; nights?: number; breakdown?: string;
+  }
+  interface WeekBucket {
+    weekStart: string; weekEnd: string; label: string;
+    inflows: LineItem[]; outflows: LineItem[];
+    totalIn: number; totalOut: number;
+    confirmedIn: number; pipelineIn: number;
+    estimatedCosts: number;
+    net: number; runningBalance: number;
+  }
 
   const weeks: WeekBucket[] = [];
   for (let i = 0; i < 34; i++) {
     const ws = addDays(weekStart, i * 7), we = addDays(ws, 6);
-    weeks.push({ weekStart: toISO(ws), weekEnd: toISO(we),
+    weeks.push({
+      weekStart: toISO(ws), weekEnd: toISO(we),
       label: `W${i+1} ${ws.toLocaleDateString("en-GB", { day:"numeric", month:"short", year: i===0 || ws.getMonth()===0 ? "2-digit" : undefined })}`,
-      inflows: [], outflows: [], totalIn: 0, totalOut: 0, confirmedIn: 0, pipelineIn: 0, net: 0, runningBalance: 0 });
+      inflows: [], outflows: [],
+      totalIn: 0, totalOut: 0, confirmedIn: 0, pipelineIn: 0, estimatedCosts: 0,
+      net: 0, runningBalance: 0,
+    });
   }
 
   function getWeekIndex(d: Date): number {
     return Math.floor((d.getTime() - weekStart.getTime()) / (86400000 * 7));
   }
 
+  // Xero confirmed inflows
   for (const inv of invData.Invoices || []) {
     const due = parseXeroDateObj(inv.DueDate); if (!due) continue;
-    const wi = getWeekIndex(due); if (wi < 0 || wi >= 34) continue;
+    const wi  = getWeekIndex(due); if (wi < 0 || wi >= 34) continue;
     const amount = inv.AmountDue || 0;
     weeks[wi].inflows.push({ ref: inv.InvoiceNumber||"—", contact: inv.Contact?.Name||"—", amount, due: toISO(due), type:"Invoice", source:"xero" });
     weeks[wi].totalIn += amount; weeks[wi].confirmedIn += amount;
   }
 
-  for (const item of spPipeline as any[]) {
+  // Sonderplan pipeline inflows + event cost outflows
+  for (const item of spPipeline as PipelineItem[]) {
+    // Inflow bucketed to payment date (1 month before event)
     const payDate = new Date(item.paymentDate);
-    const wi = getWeekIndex(payDate); if (wi < 0 || wi >= 34) continue;
-    weeks[wi].inflows.push({ ref: item.id, contact: item.name, amount: item.price, due: item.paymentDate,
-      type: item.status === "Confirmed" ? "Confirmed Event" : "Provisional Event",
-      source: "sonderplan", status: item.status, priceFlag: item.priceFlag });
-    weeks[wi].totalIn += item.price; weeks[wi].pipelineIn += item.price;
+    const wiPay   = getWeekIndex(payDate);
+    if (wiPay >= 0 && wiPay < 34) {
+      weeks[wiPay].inflows.push({
+        ref: item.id, contact: item.name, amount: item.price, due: item.paymentDate,
+        type: item.status === "Confirmed" ? "Confirmed Event" : "Provisional Event",
+        source: "sonderplan", status: item.status, priceFlag: item.priceFlag,
+      });
+      weeks[wiPay].totalIn    += item.price;
+      weeks[wiPay].pipelineIn += item.price;
+    }
+
+    // Cost outflow bucketed to event start week
+    if (item.costs.total > 0) {
+      const wiEvent = getWeekIndex(new Date(item.eventStart));
+      if (wiEvent >= 0 && wiEvent < 34) {
+        weeks[wiEvent].outflows.push({
+          ref: item.id, contact: item.name, amount: item.costs.total, due: item.eventStart,
+          type: "Est. Event Cost", source: "staff-estimate",
+          unitCount: item.unitCount, eventDays: item.eventDays,
+          miles: item.costs.miles, nights: item.costs.nights,
+          breakdown: item.costs.breakdown,
+        });
+        weeks[wiEvent].totalOut        += item.costs.total;
+        weeks[wiEvent].estimatedCosts  += item.costs.total;
+      }
+    }
   }
 
+  // Xero bills
   for (const bill of billData.Invoices || []) {
     const due = parseXeroDateObj(bill.DueDate); if (!due) continue;
-    const wi = getWeekIndex(due); if (wi < 0 || wi >= 34) continue;
+    const wi  = getWeekIndex(due); if (wi < 0 || wi >= 34) continue;
     const amount = bill.AmountDue || 0;
     weeks[wi].outflows.push({ ref: bill.InvoiceNumber||bill.Reference||"—", contact: bill.Contact?.Name||"—",
       amount, due: toISO(due), type:"Bill", source:"xero" });
     weeks[wi].totalOut += amount;
   }
 
-  const txList = (txData.BankTransactions||[]).filter((tx: any) => tx.Type==="SPEND"||tx.Type==="SPEND-OVERPAYMENT");
+  // Recurring spend detection from bank transactions
+  const txList        = (txData.BankTransactions||[]).filter((tx: any) => tx.Type==="SPEND"||tx.Type==="SPEND-OVERPAYMENT");
   const spendGroups: Record<string, { dates: Date[]; amount: number; name: string }> = {};
   const ninetyDaysAgo = addDays(new Date(), -90);
   for (const tx of txList) {
-    const d = parseXeroDateObj(tx.Date); if (!d||d<ninetyDaysAgo) continue;
-    const name = tx.Contact?.Name||tx.Reference||"Unknown";
+    const d = parseXeroDateObj(tx.Date); if (!d || d < ninetyDaysAgo) continue;
+    const name   = tx.Contact?.Name||tx.Reference||"Unknown";
     const amount = Math.round((tx.Total||0)/10)*10;
-    const key = `${name}__${amount}`;
-    if (!spendGroups[key]) spendGroups[key]={dates:[],amount:tx.Total||0,name};
+    const key    = `${name}__${amount}`;
+    if (!spendGroups[key]) spendGroups[key] = { dates: [], amount: tx.Total||0, name };
     spendGroups[key].dates.push(d);
   }
   for (const group of Object.values(spendGroups)) {
     if (group.dates.length < 2) continue;
-    group.dates.sort((a,b)=>a.getTime()-b.getTime());
-    let totalGap=0;
-    for (let i=1;i<group.dates.length;i++) totalGap+=(group.dates[i].getTime()-group.dates[i-1].getTime())/86400000;
-    const avgGap=totalGap/(group.dates.length-1);
-    const isMonthly=avgGap>=20&&avgGap<=40, isWeekly=avgGap>=5&&avgGap<=9;
-    if (!isMonthly&&!isWeekly) continue;
-    let nextDate=addDays(group.dates[group.dates.length-1],Math.round(avgGap));
-    while (nextDate<=weekEnd) {
-      const wi=getWeekIndex(nextDate);
-      if (wi>=0&&wi<13) { weeks[wi].outflows.push({ref:"Recurring",contact:group.name,amount:group.amount,
-        due:toISO(nextDate),type:isMonthly?"Est. Monthly":"Est. Weekly",source:"xero"});weeks[wi].totalOut+=group.amount; }
-      nextDate=addDays(nextDate,Math.round(avgGap));
+    group.dates.sort((a,b) => a.getTime()-b.getTime());
+    let totalGap = 0;
+    for (let i=1; i<group.dates.length; i++) totalGap += (group.dates[i].getTime()-group.dates[i-1].getTime())/86400000;
+    const avgGap    = totalGap / (group.dates.length - 1);
+    const isMonthly = avgGap >= 20 && avgGap <= 40;
+    const isWeekly  = avgGap >= 5  && avgGap <= 9;
+    if (!isMonthly && !isWeekly) continue;
+    let nextDate = addDays(group.dates[group.dates.length-1], Math.round(avgGap));
+    while (nextDate <= weekEnd) {
+      const wi = getWeekIndex(nextDate);
+      if (wi >= 0 && wi < 13) {
+        weeks[wi].outflows.push({ ref:"Recurring", contact:group.name, amount:group.amount,
+          due:toISO(nextDate), type:isMonthly?"Est. Monthly":"Est. Weekly", source:"xero" });
+        weeks[wi].totalOut += group.amount;
+      }
+      nextDate = addDays(nextDate, Math.round(avgGap));
     }
   }
 
-  let openingBalance=0;
+  // Opening balance from historical transactions
+  let openingBalance = 0;
   for (const tx of txData.BankTransactions||[]) {
-    const d=parseXeroDateObj(tx.Date); if (!d||d>=weekStart) continue;
-    const amount=tx.Total||0;
-    if (tx.Type==="RECEIVE"||tx.Type==="RECEIVE-OVERPAYMENT") openingBalance+=amount;
-    else if (tx.Type==="SPEND"||tx.Type==="SPEND-OVERPAYMENT") openingBalance-=amount;
+    const d = parseXeroDateObj(tx.Date); if (!d || d >= weekStart) continue;
+    const amount = tx.Total||0;
+    if (tx.Type==="RECEIVE"||tx.Type==="RECEIVE-OVERPAYMENT") openingBalance += amount;
+    else if (tx.Type==="SPEND"||tx.Type==="SPEND-OVERPAYMENT") openingBalance -= amount;
   }
 
-  let running=openingBalance;
-  for (const week of weeks) { week.net=week.totalIn-week.totalOut; running+=week.net; week.runningBalance=running; }
+  let running = openingBalance;
+  for (const week of weeks) { week.net = week.totalIn - week.totalOut; running += week.net; week.runningBalance = running; }
 
-  const allPipeline=spPipeline as any[];
-  const confirmedTotal  =allPipeline.filter(p=>p.status==="Confirmed").reduce((a,p)=>a+p.price,0);
-  const provisionalTotal=allPipeline.filter(p=>p.status==="Provisional").reduce((a,p)=>a+p.price,0);
-  const now = new Date();
-  const beyondWindow    =allPipeline.filter(p=>{ const wi=getWeekIndex(new Date(p.paymentDate)); return (wi<0&&new Date(p.paymentDate)>=now)||wi>=34; })
-    .sort((a,b)=>a.paymentDate.localeCompare(b.paymentDate));
+  const allPipeline      = spPipeline as PipelineItem[];
+  const today            = new Date(); today.setHours(0,0,0,0);
+  const futureItems      = allPipeline.filter(p => new Date(p.eventStart) >= today);
+  const pastItems        = allPipeline.filter(p => new Date(p.eventStart) <  today);
+  const confirmedTotal   = futureItems.filter(p => p.status==="Confirmed").reduce((a,p) => a+p.price, 0);
+  const provisionalTotal = futureItems.filter(p => p.status==="Provisional").reduce((a,p) => a+p.price, 0);
+  const totalEstimatedCosts = futureItems.reduce((a,p) => a+p.costs.total, 0);
+  const beyondWindow = futureItems
+    .filter(p => { const wi = getWeekIndex(new Date(p.paymentDate)); return (wi<0 && new Date(p.paymentDate)>=today) || wi>=34; })
+    .sort((a,b) => a.paymentDate.localeCompare(b.paymentDate));
 
-  return Response.json({ openingBalance, generatedAt: new Date().toISOString(),
-    forecastFrom: toISO(weekStart), forecastTo: toISO(weekEnd),
+  // Past events: still Confirmed/Provisional after event date = potential uninvoiced work.
+  // NOT included in any cash flow figures. Flagged for manual review.
+  // When invoice reference link is built (item 5), this becomes an automatic reconciliation.
+  const uninvoicedWarnings = pastItems
+    .sort((a,b) => b.eventStart.localeCompare(a.eventStart))
+    .map(p => ({
+      ...p,
+      warningNote: "Event date passed — still Confirmed/Provisional in Sonderplan. Check whether invoice has been raised and paid in Xero.",
+    }));
+
+  return Response.json({
+    openingBalance,
+    generatedAt: new Date().toISOString(),
+    forecastFrom: toISO(weekStart),
+    forecastTo: toISO(weekEnd),
     sonderplanConnected: !!env.SONDERPLAN_TOKEN,
-    pipeline: { confirmedTotal, provisionalTotal, itemCount: allPipeline.length,
-      inWindowCount: allPipeline.length-beyondWindow.length, beyondWindow,
-      allItems: allPipeline }, // full list for frontend toggle rebucketing
-    weeks }, { headers: { "Access-Control-Allow-Origin": "*" } });
+    costSettings: settings,
+    pipeline: {
+      confirmedTotal, provisionalTotal, totalEstimatedCosts,
+      itemCount:     futureItems.length,
+      inWindowCount: futureItems.length - beyondWindow.length,
+      beyondWindow,
+      allItems:      futureItems,
+    },
+    // Events that have passed but are still Confirmed/Provisional in Sonderplan.
+    // Excluded from all forecast figures. Manual check required until Xero link is built.
+    uninvoicedWarnings,
+    uninvoicedCount:      uninvoicedWarnings.length,
+    uninvoicedTotalValue: uninvoicedWarnings.reduce((a,p) => a+p.price, 0),
+    weeks,
+  }, { headers: { "Access-Control-Allow-Origin": "*" } });
+}
+
+async function handleBankBalance(env: Env): Promise<Response> {
+  let tokens: XeroTokens;
+  try { tokens = await getValidTokens(env); } catch (e: any) { return new Response(e.message, { status: 401 }); }
+  const res = await fetch(`${XERO_API_BASE}/Accounts?where=Type%3D%3D%22BANK%22`, {
+    headers: { Authorization: `Bearer ${tokens.access_token}`, "Xero-tenant-id": tokens.tenant_id, Accept: "application/json" },
+  });
+  if (!res.ok) return new Response("Failed: " + await res.text(), { status: 500 });
+  const data: any = await res.json();
+  const accounts = (data.Accounts || []).map((a: any) => ({
+    name:           a.Name,
+    code:           a.Code,
+    currencyBalance: a.CurrencyCode,
+    balance:        a.ReportingCodeUpdatedDateUTC ? null : (a.Balance ?? null),
+    // Balance field isn't always present on Accounts endpoint — use BankSummary fallback
+  }));
+  // Xero Accounts endpoint doesn't reliably return Balance — use Reports/BankSummary instead
+  const rptRes = await fetch(`${XERO_API_BASE}/Reports/BankSummary`, {
+    headers: { Authorization: `Bearer ${tokens.access_token}`, "Xero-tenant-id": tokens.tenant_id, Accept: "application/json" },
+  });
+  if (!rptRes.ok) {
+    // Fallback: sum what we have from Accounts
+    const total = accounts.reduce((a: number, acc: any) => a + (acc.balance ?? 0), 0);
+    return Response.json({ total, accounts, source: "accounts-endpoint" }, { headers: { "Access-Control-Allow-Origin": "*" } });
+  }
+  const rptData: any = await rptRes.json();
+  // BankSummary report structure: Rows → Row → Cells with balance data
+  let total = 0;
+  const bankAccounts: { name: string; balance: number }[] = [];
+  for (const section of rptData.Reports?.[0]?.Rows || []) {
+    for (const row of section.Rows || []) {
+      const cells = row.Cells || [];
+      if (cells.length >= 2) {
+        const name    = cells[0]?.Value || "";
+        const balance = parseFloat((cells[cells.length - 1]?.Value || "0").replace(/[^0-9.-]/g, ""));
+        if (name && !isNaN(balance)) {
+          bankAccounts.push({ name, balance });
+          total += balance;
+        }
+      }
+    }
+  }
+  return Response.json({ total, accounts: bankAccounts, source: "bank-summary-report" },
+    { headers: { "Access-Control-Allow-Origin": "*" } });
 }
 
 async function handleCashflow(env: Env): Promise<Response> {
@@ -451,12 +866,12 @@ async function handleCashflow(env: Env): Promise<Response> {
   const data: any = await res.json();
   const monthly: Record<string,{inflow:number;outflow:number;net:number}> = {};
   for (const tx of data.BankTransactions||[]) {
-    const date=parseXeroDate(tx.Date); if (!date) continue;
-    if (!monthly[date]) monthly[date]={inflow:0,outflow:0,net:0};
-    const amount: number=tx.Total||0;
-    if (tx.Type==="RECEIVE"||tx.Type==="RECEIVE-OVERPAYMENT") monthly[date].inflow+=amount;
-    else if (tx.Type==="SPEND"||tx.Type==="SPEND-OVERPAYMENT") monthly[date].outflow+=amount;
-    monthly[date].net=monthly[date].inflow-monthly[date].outflow;
+    const date = parseXeroDate(tx.Date); if (!date) continue;
+    if (!monthly[date]) monthly[date] = {inflow:0,outflow:0,net:0};
+    const amount: number = tx.Total||0;
+    if (tx.Type==="RECEIVE"||tx.Type==="RECEIVE-OVERPAYMENT") monthly[date].inflow += amount;
+    else if (tx.Type==="SPEND"||tx.Type==="SPEND-OVERPAYMENT") monthly[date].outflow += amount;
+    monthly[date].net = monthly[date].inflow - monthly[date].outflow;
   }
   return Response.json(Object.fromEntries(Object.entries(monthly).sort(([a],[b])=>a.localeCompare(b))),
     { headers: { "Access-Control-Allow-Origin":"*" } });
@@ -470,13 +885,13 @@ async function handleInvoicesByMonth(env: Env): Promise<Response> {
   if (!res.ok) return new Response("Failed: "+await res.text(), { status: 500 });
   const data: any = await res.json();
   const byMonth: Record<string,{total:number;count:number;overdue:number;invoices:any[]}> = {};
-  const now=new Date(); now.setHours(0,0,0,0);
+  const now = new Date(); now.setHours(0,0,0,0);
   for (const inv of data.Invoices||[]) {
-    const due=parseXeroDateObj(inv.DueDate); if (!due) continue;
-    const month=due.toISOString().substring(0,7), amount=inv.AmountDue||0, isOver=due<now;
-    if (!byMonth[month]) byMonth[month]={total:0,count:0,overdue:0,invoices:[]};
-    byMonth[month].total+=amount; byMonth[month].count+=1;
-    if (isOver) byMonth[month].overdue+=amount;
+    const due = parseXeroDateObj(inv.DueDate); if (!due) continue;
+    const month = due.toISOString().substring(0,7), amount = inv.AmountDue||0, isOver = due<now;
+    if (!byMonth[month]) byMonth[month] = {total:0,count:0,overdue:0,invoices:[]};
+    byMonth[month].total += amount; byMonth[month].count += 1;
+    if (isOver) byMonth[month].overdue += amount;
     byMonth[month].invoices.push({ref:inv.InvoiceNumber,contact:inv.Contact?.Name||"—",amount,due:toISO(due),overdue:isOver});
   }
   return Response.json(Object.fromEntries(Object.entries(byMonth).sort(([a],[b])=>a.localeCompare(b))),
@@ -492,56 +907,60 @@ async function handleCashBurn(env: Env): Promise<Response> {
   const data: any = await res.json();
   const monthly: Record<string,{spend:number;receive:number;net:number}> = {};
   for (const tx of data.BankTransactions||[]) {
-    const date=parseXeroDate(tx.Date); if (!date) continue;
-    if (!monthly[date]) monthly[date]={spend:0,receive:0,net:0};
-    const amount: number=tx.Total||0;
-    if (tx.Type==="SPEND"||tx.Type==="SPEND-OVERPAYMENT") monthly[date].spend+=amount;
-    else if (tx.Type==="RECEIVE"||tx.Type==="RECEIVE-OVERPAYMENT") monthly[date].receive+=amount;
-    monthly[date].net=monthly[date].receive-monthly[date].spend;
+    const date = parseXeroDate(tx.Date); if (!date) continue;
+    if (!monthly[date]) monthly[date] = {spend:0,receive:0,net:0};
+    const amount: number = tx.Total||0;
+    if (tx.Type==="SPEND"||tx.Type==="SPEND-OVERPAYMENT") monthly[date].spend += amount;
+    else if (tx.Type==="RECEIVE"||tx.Type==="RECEIVE-OVERPAYMENT") monthly[date].receive += amount;
+    monthly[date].net = monthly[date].receive - monthly[date].spend;
   }
-  const sorted=Object.entries(monthly).sort(([a],[b])=>a.localeCompare(b));
-  let running=0;
-  const result: Record<string,any>={};
-  for (const [month,vals] of sorted) { running+=vals.net; result[month]={...vals,runningBalance:running}; }
+  const sorted = Object.entries(monthly).sort(([a],[b])=>a.localeCompare(b));
+  let running = 0;
+  const result: Record<string,any> = {};
+  for (const [month,vals] of sorted) { running += vals.net; result[month] = {...vals, runningBalance: running}; }
   return Response.json(result, { headers: { "Access-Control-Allow-Origin":"*" } });
 }
 
 async function handleProfitAndLoss(env: Env): Promise<Response> {
   let tokens: XeroTokens;
   try { tokens = await getValidTokens(env); } catch (e: any) { return new Response(e.message, { status: 401 }); }
-  const year=new Date().getFullYear();
-  const h={Authorization:`Bearer ${tokens.access_token}`,"Xero-tenant-id":tokens.tenant_id,Accept:"application/json"};
-  const [invRes,txRes]=await Promise.all([
-    fetch(`${XERO_API_BASE}/Invoices?where=Status%3D%3D%22PAID%22&fromDate=${year}-01-01&toDate=${year}-12-31`,{headers:h}),
-    fetch(`${XERO_API_BASE}/BankTransactions?fromDate=${year}-01-01&toDate=${year}-12-31`,{headers:h}),
+  const year = new Date().getFullYear();
+  const h = { Authorization:`Bearer ${tokens.access_token}`, "Xero-tenant-id":tokens.tenant_id, Accept:"application/json" };
+  const [invRes,txRes] = await Promise.all([
+    fetch(`${XERO_API_BASE}/Invoices?where=Status%3D%3D%22PAID%22&fromDate=${year}-01-01&toDate=${year}-12-31`, {headers:h}),
+    fetch(`${XERO_API_BASE}/BankTransactions?fromDate=${year}-01-01&toDate=${year}-12-31`, {headers:h}),
   ]);
-  if (!invRes.ok) return new Response("Failed invoices: "+await invRes.text(),{status:500});
-  if (!txRes.ok)  return new Response("Failed tx: "+await txRes.text(),{status:500});
-  const invData: any=await invRes.json(), txData: any=await txRes.json();
-  const months: string[]=[];
-  for (let m=1;m<=12;m++) months.push(`${year}-${String(m).padStart(2,"0")}`);
-  const pnl: Record<string,{income:number;expenses:number;profit:number}>={};
-  for (const m of months) pnl[m]={income:0,expenses:0,profit:0};
+  if (!invRes.ok) return new Response("Failed invoices: "+await invRes.text(), {status:500});
+  if (!txRes.ok)  return new Response("Failed tx: "+await txRes.text(), {status:500});
+  const invData: any = await invRes.json(), txData: any = await txRes.json();
+  const months: string[] = [];
+  for (let m=1; m<=12; m++) months.push(`${year}-${String(m).padStart(2,"0")}`);
+  const pnl: Record<string,{income:number;expenses:number;profit:number}> = {};
+  for (const m of months) pnl[m] = {income:0,expenses:0,profit:0};
   for (const inv of invData.Invoices||[]) {
-    const date=parseXeroDate(inv.FullyPaidOnDate)||parseXeroDate(inv.Date);
-    if (!date||!pnl[date]) continue; pnl[date].income+=inv.Total||0;
+    const date = parseXeroDate(inv.FullyPaidOnDate)||parseXeroDate(inv.Date);
+    if (!date||!pnl[date]) continue; pnl[date].income += inv.Total||0;
   }
   for (const tx of txData.BankTransactions||[]) {
-    const date=parseXeroDate(tx.Date); if (!date||!pnl[date]) continue;
-    if (tx.Type==="SPEND"||tx.Type==="SPEND-OVERPAYMENT") pnl[date].expenses+=tx.Total||0;
+    const date = parseXeroDate(tx.Date); if (!date||!pnl[date]) continue;
+    if (tx.Type==="SPEND"||tx.Type==="SPEND-OVERPAYMENT") pnl[date].expenses += tx.Total||0;
   }
-  for (const m of months) pnl[m].profit=pnl[m].income-pnl[m].expenses;
-  return Response.json(pnl,{headers:{"Access-Control-Allow-Origin":"*"}});
+  for (const m of months) pnl[m].profit = pnl[m].income - pnl[m].expenses;
+  return Response.json(pnl, {headers:{"Access-Control-Allow-Origin":"*"}});
 }
 
+// ─── Page serving ─────────────────────────────────────────────────────────────
 function serveDashboard(): Response {
   return new Response(DASHBOARD_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
 }
-
 function serveForecast(): Response {
   return new Response(FORECAST_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
 }
+function serveSettings(): Response {
+  return new Response(SETTINGS_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+}
 
+// ─── Dashboard HTML (unchanged from previous version) ─────────────────────────
 const DASHBOARD_HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -561,7 +980,8 @@ header{display:flex;align-items:flex-end;justify-content:space-between;margin-bo
 .logo-area p{font-size:0.7rem;color:var(--muted);margin-top:4px;letter-spacing:0.1em;text-transform:uppercase}
 .header-meta{text-align:right;font-size:0.7rem;color:var(--muted)}
 #last-updated{color:var(--accent2);display:block;margin-top:4px}
-.nav-link{display:inline-block;margin-top:8px;font-size:0.68rem;color:var(--accent);text-decoration:none;letter-spacing:0.08em;border:1px solid var(--accent);padding:5px 12px;border-radius:4px;transition:all 0.2s}
+.nav-links{display:flex;gap:8px;margin-top:8px;justify-content:flex-end}
+.nav-link{display:inline-block;font-size:0.68rem;color:var(--accent);text-decoration:none;letter-spacing:0.08em;border:1px solid var(--accent);padding:5px 12px;border-radius:4px;transition:all 0.2s}
 .nav-link:hover{background:var(--accent);color:#fff}
 .refresh-btn{background:none;border:1px solid var(--border);color:var(--muted);padding:6px 14px;border-radius:4px;cursor:pointer;font-family:'DM Mono',monospace;font-size:0.68rem;letter-spacing:0.08em;text-transform:uppercase;margin-top:8px;transition:all 0.2s;display:block}
 .refresh-btn:hover{border-color:var(--accent);color:var(--accent)}
@@ -611,6 +1031,10 @@ header{display:flex;align-items:flex-end;justify-content:space-between;margin-bo
 .burn-stat{background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:14px}
 .burn-stat-label{font-size:0.6rem;letter-spacing:0.12em;text-transform:uppercase;color:var(--muted);margin-bottom:6px}
 .burn-stat-value{font-family:'Syne',sans-serif;font-size:1.1rem;font-weight:700}
+.burn-toggle{display:flex;gap:6px;margin-bottom:14px}
+.burn-btn{background:var(--surface2);border:1px solid var(--border);color:var(--muted);padding:5px 12px;border-radius:4px;cursor:pointer;font-family:'DM Mono',monospace;font-size:0.65rem;letter-spacing:0.08em;text-transform:uppercase;transition:all 0.2s}
+.burn-btn:hover{border-color:var(--accent2);color:var(--accent2)}
+.burn-btn.active{background:var(--accent2);border-color:var(--accent2);color:#0a0a0f}
 .loading-text{font-size:0.68rem;color:var(--muted);letter-spacing:0.1em;text-transform:uppercase;animation:pulse 1.5s ease-in-out infinite}
 .error-text{font-size:0.68rem;color:var(--red)}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
@@ -624,7 +1048,10 @@ header{display:flex;align-items:flex-end;justify-content:space-between;margin-bo
     <div class="logo-area"><h1>Finance<span>.</span></h1><p>Live overview — powered by Xero</p></div>
     <div class="header-meta">
       <span>LAST UPDATED</span><span id="last-updated">—</span>
-      <a href="/forecast" class="nav-link">↗ 8-Month Forecast</a>
+      <div class="nav-links">
+        <a href="/forecast" class="nav-link">Forecast</a>
+        <a href="/settings" class="nav-link">Settings</a>
+      </div>
       <button class="refresh-btn" onclick="loadAll()">↻ Refresh</button>
     </div>
   </header>
@@ -642,11 +1069,16 @@ header{display:flex;align-items:flex-end;justify-content:space-between;margin-bo
   <div class="section-label">Cash Burn</div>
   <div class="grid-full" style="margin-bottom:32px">
     <div class="card">
-      <div class="card-header"><span class="card-title">Spend & Running Balance</span><span class="card-badge">All time</span></div>
+      <div class="card-header"><span class="card-title">Spend & Running Balance</span><span class="card-badge" id="burn-badge">Last 24 months</span></div>
+      <div class="burn-toggle">
+        <button class="burn-btn" id="burn-btn-12" onclick="setBurnWindow(12)">12 months</button>
+        <button class="burn-btn active" id="burn-btn-24" onclick="setBurnWindow(24)">24 months</button>
+        <button class="burn-btn" id="burn-btn-all" onclick="setBurnWindow(0)">All time</button>
+      </div>
       <div class="burn-stats">
         <div class="burn-stat"><div class="burn-stat-label">This month spend</div><div class="burn-stat-value negative" id="burn-this-month">—</div></div>
         <div class="burn-stat"><div class="burn-stat-label">Avg monthly spend</div><div class="burn-stat-value neutral" id="burn-avg">—</div></div>
-        <div class="burn-stat"><div class="burn-stat-label">Running balance</div><div class="burn-stat-value neutral" id="burn-balance">—</div></div>
+        <div class="burn-stat"><div class="burn-stat-label">Actual bank balance</div><div class="burn-stat-value neutral" id="burn-balance">—</div><div style="font-size:0.6rem;color:var(--muted);margin-top:3px" id="burn-balance-src"></div></div>
       </div>
       <div class="chart-wrap-tall"><canvas id="burnChart"></canvas><div id="burn-loading" class="loading-text">Fetching spend data…</div></div>
     </div>
@@ -672,16 +1104,22 @@ const fmtMo=s=>{try{const[y,m]=s.split('-');return new Date(y,m-1,1).toLocaleDat
 Chart.defaults.color='#6b6b8a';Chart.defaults.borderColor='#2a2a40';Chart.defaults.font.family="'DM Mono',monospace";Chart.defaults.font.size=11;
 let cashflowChart,donutChart,burnChart,invMonthChart,pnlChart;
 async function loadCashflow(){try{const res=await fetch('/api/cashflow');if(!res.ok)throw new Error(await res.text());const data=await res.json();document.getElementById('cashflow-loading')?.remove();document.getElementById('donut-loading')?.remove();const labels=Object.keys(data).slice(-12);const inflow=labels.map(m=>data[m].inflow),outflow=labels.map(m=>data[m].outflow),net=labels.map(m=>data[m].net);const latest=data[labels[labels.length-1]];if(latest){const el=document.getElementById('kpi-net');el.textContent=fmt(latest.net);el.className='kpi-value '+(latest.net>=0?'positive':'negative');document.getElementById('kpi-net-sub').textContent='In '+fmt(latest.inflow)+' / Out '+fmt(latest.outflow);document.getElementById('donut-label').textContent=fmtMo(labels[labels.length-1]);}if(cashflowChart)cashflowChart.destroy();cashflowChart=new Chart(document.getElementById('cashflowChart').getContext('2d'),{type:'bar',data:{labels:labels.map(fmtMo),datasets:[{label:'Inflow',data:inflow,backgroundColor:'rgba(78,205,196,0.7)',borderRadius:3,borderSkipped:false},{label:'Outflow',data:outflow,backgroundColor:'rgba(255,107,107,0.7)',borderRadius:3,borderSkipped:false},{label:'Net',data:net,type:'line',borderColor:'#7c6af7',backgroundColor:'rgba(124,106,247,0.08)',borderWidth:2,pointRadius:3,fill:true,tension:0.3,yAxisID:'y'}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index'},plugins:{legend:{display:true,position:'bottom',labels:{boxWidth:10,padding:14}}},scales:{x:{grid:{color:'#2a2a40'}},y:{grid:{color:'#2a2a40'},ticks:{callback:v=>fmt(v)}}}}});if(donutChart)donutChart.destroy();donutChart=new Chart(document.getElementById('donutChart').getContext('2d'),{type:'doughnut',data:{labels:['Inflow','Outflow'],datasets:[{data:[latest?.inflow||0,latest?.outflow||0],backgroundColor:['rgba(78,205,196,0.85)','rgba(255,107,107,0.85)'],borderColor:'#12121a',borderWidth:3,hoverOffset:8}]},options:{responsive:true,maintainAspectRatio:false,cutout:'68%',plugins:{legend:{position:'bottom',labels:{boxWidth:10,padding:14}},tooltip:{callbacks:{label:ctx=>' '+fmt(ctx.raw)}}}}});}catch(e){const el=document.getElementById('cashflow-loading');if(el){el.textContent='Error: '+e.message;el.className='error-text';}}}
-async function loadCashBurn(){try{const res=await fetch('/api/cashburn');if(!res.ok)throw new Error(await res.text());const data=await res.json();document.getElementById('burn-loading')?.remove();const months=Object.keys(data),spend=months.map(m=>data[m].spend),balance=months.map(m=>data[m].runningBalance),latest=data[months[months.length-1]];const last6=spend.slice(-6),avg=last6.reduce((a,b)=>a+b,0)/(last6.length||1);document.getElementById('burn-this-month').textContent=fmt(latest?.spend||0);document.getElementById('burn-avg').textContent=fmt(avg);const bal=latest?.runningBalance||0,balEl=document.getElementById('burn-balance');balEl.textContent=fmt(bal);balEl.className='burn-stat-value '+(bal>=0?'positive':'negative');document.getElementById('kpi-burn').textContent=fmt(avg);document.getElementById('kpi-burn').className='kpi-value negative';document.getElementById('kpi-burn-sub').textContent='6-month average';if(burnChart)burnChart.destroy();burnChart=new Chart(document.getElementById('burnChart').getContext('2d'),{type:'bar',data:{labels:months.map(fmtMo),datasets:[{label:'Monthly Spend',data:spend,backgroundColor:'rgba(255,107,107,0.6)',borderRadius:3,borderSkipped:false,yAxisID:'y'},{label:'Running Balance',data:balance,type:'line',borderColor:'#ffd93d',backgroundColor:'rgba(255,217,61,0.06)',borderWidth:2,pointRadius:2,fill:true,tension:0.3,yAxisID:'y1'}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index'},plugins:{legend:{display:true,position:'bottom',labels:{boxWidth:10,padding:14}}},scales:{x:{grid:{color:'#2a2a40'}},y:{grid:{color:'#2a2a40'},ticks:{callback:v=>fmt(v)},title:{display:true,text:'Spend',color:'#6b6b8a',font:{size:10}}},y1:{position:'right',grid:{display:false},ticks:{callback:v=>fmt(v)},title:{display:true,text:'Balance',color:'#6b6b8a',font:{size:10}}}}}});}catch(e){const el=document.getElementById('burn-loading');if(el){el.textContent='Error: '+e.message;el.className='error-text';}}}
+let burnAllData=null;let burnWindow=24;
+function renderBurnChart(data,months){if(burnChart)burnChart.destroy();const spend=months.map(m=>data[m].spend),balance=months.map(m=>data[m].runningBalance);const last6=spend.slice(-6),avg=last6.reduce((a,b)=>a+b,0)/(last6.length||1);const latest=data[months[months.length-1]];document.getElementById('burn-this-month').textContent=fmt(latest?.spend||0);document.getElementById('burn-avg').textContent=fmt(avg);document.getElementById('kpi-burn').textContent=fmt(avg);document.getElementById('kpi-burn').className='kpi-value negative';document.getElementById('kpi-burn-sub').textContent='6-month average';burnChart=new Chart(document.getElementById('burnChart').getContext('2d'),{type:'bar',data:{labels:months.map(fmtMo),datasets:[{label:'Monthly Spend',data:spend,backgroundColor:'rgba(255,107,107,0.6)',borderRadius:3,borderSkipped:false,yAxisID:'y'},{label:'Running Balance',data:balance,type:'line',borderColor:'#ffd93d',backgroundColor:'rgba(255,217,61,0.06)',borderWidth:2,pointRadius:2,fill:true,tension:0.3,yAxisID:'y1'}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index'},plugins:{legend:{display:true,position:'bottom',labels:{boxWidth:10,padding:14}}},scales:{x:{grid:{color:'#2a2a40'}},y:{grid:{color:'#2a2a40'},ticks:{callback:v=>fmt(v)},title:{display:true,text:'Spend',color:'#6b6b8a',font:{size:10}}},y1:{position:'right',grid:{display:false},ticks:{callback:v=>fmt(v)},title:{display:true,text:'Balance',color:'#6b6b8a',font:{size:10}}}}}})}
+async function loadBankBalance(){try{const res=await fetch('/api/bankbalance');if(!res.ok)throw new Error(await res.text());const data=await res.json();const balEl=document.getElementById('burn-balance');balEl.textContent=fmt(data.total);balEl.className='burn-stat-value '+(data.total>=0?'positive':'negative');const srcEl=document.getElementById('burn-balance-src');if(srcEl&&data.accounts&&data.accounts.length){srcEl.textContent=data.accounts.map(a=>a.name+': '+fmt(a.balance)).join(' • ');}}catch(e){const el=document.getElementById('burn-balance');if(el){el.textContent='Error';el.className='burn-stat-value negative';}const srcEl=document.getElementById('burn-balance-src');if(srcEl)srcEl.textContent=e.message;}}
+function setBurnWindow(n){burnWindow=n;['12','24','all'].forEach(k=>{const btn=document.getElementById('burn-btn-'+k);if(btn)btn.className='burn-btn'+((k==='all'&&n===0)||(k==='12'&&n===12)||(k==='24'&&n===24)?' active':'');});const labels={0:'All time',12:'Last 12 months',24:'Last 24 months'};document.getElementById('burn-badge').textContent=labels[n]||'Last '+n+' months';if(!burnAllData)return;const allMonths=Object.keys(burnAllData);const months=n===0?allMonths:allMonths.slice(-n);renderBurnChart(burnAllData,months);}
+async function loadCashBurn(){try{const res=await fetch('/api/cashburn');if(!res.ok)throw new Error(await res.text());const data=await res.json();document.getElementById('burn-loading')?.remove();burnAllData=data;const allMonths=Object.keys(data);const months=burnWindow===0?allMonths:allMonths.slice(-burnWindow);renderBurnChart(data,months);}catch(e){const el=document.getElementById('burn-loading');if(el){el.textContent='Error: '+e.message;el.className='error-text';}}}
 async function loadInvoicesByMonth(){try{const res=await fetch('/api/invoices-by-month');if(!res.ok)throw new Error(await res.text());const data=await res.json();document.getElementById('inv-month-loading')?.remove();const months=Object.keys(data),totals=months.map(m=>data[m].total),overdueTot=months.map(m=>data[m].overdue);const totalAll=totals.reduce((a,b)=>a+b,0),totalOv=overdueTot.reduce((a,b)=>a+b,0);const countAll=months.reduce((a,m)=>a+data[m].count,0),countOv=months.reduce((a,m)=>a+data[m].invoices.filter(i=>i.overdue).length,0);document.getElementById('kpi-inv-total').textContent=fmt(totalAll);document.getElementById('kpi-inv-total').className='kpi-value neutral';document.getElementById('kpi-inv-count').textContent=countAll+' invoices outstanding';const ovEl=document.getElementById('kpi-overdue');ovEl.textContent=fmt(totalOv);ovEl.className='kpi-value '+(totalOv>0?'negative':'positive');document.getElementById('kpi-overdue-count').textContent=countOv+' invoice'+(countOv!==1?'s':'')+' overdue';document.getElementById('inv-month-badge').textContent=months.length+' months';if(invMonthChart)invMonthChart.destroy();invMonthChart=new Chart(document.getElementById('invMonthChart').getContext('2d'),{type:'bar',data:{labels:months.map(fmtMo),datasets:[{label:'Overdue',data:overdueTot,backgroundColor:'rgba(255,107,107,0.75)',borderRadius:3,borderSkipped:false},{label:'On track',data:totals.map((t,i)=>t-overdueTot[i]),backgroundColor:'rgba(78,205,196,0.6)',borderRadius:3,borderSkipped:false}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index'},plugins:{legend:{display:true,position:'bottom',labels:{boxWidth:10,padding:14}},tooltip:{callbacks:{footer:items=>'Total: '+fmt(items.reduce((a,i)=>a+i.raw,0))}}},scales:{x:{stacked:true,grid:{color:'#2a2a40'}},y:{stacked:true,grid:{color:'#2a2a40'},ticks:{callback:v=>fmt(v)}}}}});const listHtml=months.map((month,idx)=>{const d=data[month],hasOv=d.overdue>0;const rows=d.invoices.map(inv=>'<div class="inv-row"><span class="inv-ref2">'+inv.ref+'</span><span class="inv-name">'+inv.contact+'</span><span class="inv-amt">'+fmtDec(inv.amount)+'</span><span class="inv-due'+(inv.overdue?' overdue':'')+'">'+inv.due+'</span></div>').join('');const open=idx===0?' open':'';return'<div class="month-group"><div class="month-header" onclick="toggleMonth(this)"><div style="display:flex;align-items:center;gap:10px"><span class="chevron'+(idx===0?' open':'')+'">&#9654;</span><span class="month-name">'+fmtMo(month)+'</span></div><div class="month-meta">'+(hasOv?'<span class="overdue-flag">'+fmt(d.overdue)+' overdue</span>':'')+'<span class="month-count">'+d.count+' inv</span><span class="month-total">'+fmt(d.total)+'</span></div></div><div class="month-rows'+open+'">'+rows+'</div></div>';}).join('');document.getElementById('inv-month-list').innerHTML=listHtml||'<div style="color:var(--muted);font-size:0.7rem">No outstanding invoices</div>';}catch(e){const el=document.getElementById('inv-month-loading');if(el){el.textContent='Error: '+e.message;el.className='error-text';}document.getElementById('inv-month-list').innerHTML='<div class="error-text">'+e.message+'</div>';}}
 function toggleMonth(h){const r=h.nextElementSibling,c=h.querySelector('.chevron'),o=r.classList.toggle('open');c.classList.toggle('open',o);}
 async function loadPnL(){try{const res=await fetch('/api/pnl');if(!res.ok)throw new Error(await res.text());const data=await res.json();document.getElementById('pnl-loading')?.remove();const months=Object.keys(data),income=months.map(m=>data[m].income),expenses=months.map(m=>data[m].expenses),profit=months.map(m=>data[m].profit);const ytdI=income.reduce((a,b)=>a+b,0),ytdE=expenses.reduce((a,b)=>a+b,0),ytdP=ytdI-ytdE;document.getElementById('pnl-summary').innerHTML='<div class="burn-stat"><div class="burn-stat-label">YTD Revenue</div><div class="burn-stat-value positive">'+fmt(ytdI)+'</div></div><div class="burn-stat"><div class="burn-stat-label">YTD Costs</div><div class="burn-stat-value negative">'+fmt(ytdE)+'</div></div><div class="burn-stat"><div class="burn-stat-label">YTD Profit</div><div class="burn-stat-value '+(ytdP>=0?'positive':'negative')+'">'+fmt(ytdP)+'</div></div>';if(pnlChart)pnlChart.destroy();pnlChart=new Chart(document.getElementById('pnlChart').getContext('2d'),{type:'line',data:{labels:months.map(fmtMo),datasets:[{label:'Income',data:income,borderColor:'rgba(78,205,196,0.9)',backgroundColor:'rgba(78,205,196,0.07)',borderWidth:2,pointRadius:3,fill:true,tension:0.3},{label:'Expenses',data:expenses,borderColor:'rgba(255,107,107,0.9)',backgroundColor:'rgba(255,107,107,0.07)',borderWidth:2,pointRadius:3,fill:true,tension:0.3},{label:'Net Profit',data:profit,borderColor:'#7c6af7',backgroundColor:'transparent',borderWidth:2,pointRadius:3,borderDash:[4,4],tension:0.3}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index'},plugins:{legend:{display:true,position:'bottom',labels:{boxWidth:10,padding:14}}},scales:{x:{grid:{color:'#2a2a40'}},y:{grid:{color:'#2a2a40'},ticks:{callback:v=>fmt(v)}}}}});}catch(e){const el=document.getElementById('pnl-loading');if(el){el.textContent='Error: '+e.message;el.className='error-text';}}}
-async function loadAll(){document.getElementById('last-updated').textContent='Loading…';await Promise.all([loadCashflow(),loadCashBurn(),loadInvoicesByMonth(),loadPnL()]);document.getElementById('last-updated').textContent=new Date().toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',second:'2-digit'});}
+async function loadAll(){document.getElementById('last-updated').textContent='Loading…';await Promise.all([loadCashflow(),loadCashBurn(),loadBankBalance(),loadInvoicesByMonth(),loadPnL()]);document.getElementById('last-updated').textContent=new Date().toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',second:'2-digit'});}
 loadAll();
 </script>
 </body></html>
 `;
-const FORECAST_HTML  = `<!DOCTYPE html>
+
+// ─── Forecast HTML ─────────────────────────────────────────────────────────────
+const FORECAST_HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -690,7 +1128,7 @@ const FORECAST_HTML  = `<!DOCTYPE html>
 <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@300;400;500&display=swap" rel="stylesheet">
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-:root{--bg:#0a0a0f;--surface:#12121a;--surface2:#1a1a26;--border:#2a2a40;--accent:#7c6af7;--accent2:#4ecdc4;--accent3:#ff6b6b;--accent4:#ffd93d;--text:#e8e8f0;--muted:#6b6b8a;--green:#51cf66;--red:#ff6b6b}
+:root{--bg:#0a0a0f;--surface:#12121a;--surface2:#1a1a26;--border:#2a2a40;--accent:#7c6af7;--accent2:#4ecdc4;--accent3:#ff6b6b;--accent4:#ffd93d;--text:#e8e8f0;--muted:#6b6b8a;--green:#51cf66;--red:#ff6b6b;--orange:#ff9f43}
 body{background:var(--bg);color:var(--text);font-family:'DM Mono',monospace;min-height:100vh;overflow-x:hidden}
 body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(var(--border) 1px,transparent 1px),linear-gradient(90deg,var(--border) 1px,transparent 1px);background-size:40px 40px;opacity:0.25;pointer-events:none;z-index:0}
 .container{position:relative;z-index:1;max-width:1400px;margin:0 auto;padding:40px 32px}
@@ -698,13 +1136,16 @@ header{display:flex;align-items:flex-end;justify-content:space-between;margin-bo
 .logo-area h1{font-family:'Syne',sans-serif;font-size:2rem;font-weight:800;letter-spacing:-0.03em}
 .logo-area h1 span{color:var(--accent)}
 .logo-area p{font-size:0.7rem;color:var(--muted);margin-top:4px;letter-spacing:0.1em;text-transform:uppercase}
+.nav-links{display:flex;gap:8px}
 .nav-link{display:inline-block;font-size:0.68rem;color:var(--accent);text-decoration:none;letter-spacing:0.08em;border:1px solid var(--accent);padding:5px 12px;border-radius:4px;transition:all 0.2s}
 .nav-link:hover{background:var(--accent);color:#fff}
-.pipeline-banner{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:24px;padding:16px;background:rgba(124,106,247,0.08);border:1px solid rgba(124,106,247,0.3);border-radius:8px}
+.pipeline-banner{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px;padding:16px;background:rgba(124,106,247,0.08);border:1px solid rgba(124,106,247,0.3);border-radius:8px}
+.cost-banner{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:24px;padding:16px;background:rgba(255,159,67,0.07);border:1px solid rgba(255,159,67,0.3);border-radius:8px}
 .pipeline-stat{text-align:center}
 .pipeline-stat-label{font-size:0.6rem;letter-spacing:0.12em;text-transform:uppercase;color:var(--muted);margin-bottom:4px}
 .pipeline-stat-value{font-family:'Syne',sans-serif;font-size:1.1rem;font-weight:700}
 .sp-badge{font-size:0.58rem;padding:2px 7px;border-radius:3px;background:rgba(124,106,247,0.2);color:var(--accent);letter-spacing:0.08em;text-transform:uppercase;margin-left:6px}
+.cost-badge{font-size:0.58rem;padding:2px 7px;border-radius:3px;background:rgba(255,159,67,0.2);color:var(--orange);letter-spacing:0.08em;text-transform:uppercase;margin-left:6px}
 .kpi-row{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:24px}
 .kpi-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:20px;position:relative;overflow:hidden;opacity:0;transform:translateY(8px);animation:fadeUp 0.4s ease forwards}
 .kpi-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px}
@@ -722,14 +1163,14 @@ header{display:flex;align-items:flex-end;justify-content:space-between;margin-bo
 .card-badge{font-size:0.62rem;letter-spacing:0.1em;text-transform:uppercase;color:var(--muted);background:var(--surface2);padding:3px 8px;border-radius:3px;border:1px solid var(--border)}
 .chart-wrap{position:relative;height:280px}
 .section-label{font-size:0.62rem;letter-spacing:0.18em;text-transform:uppercase;color:var(--muted);margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--border)}
-.week-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(72px,1fr));gap:6px;margin-bottom:24px}
+.week-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(76px,1fr));gap:6px;margin-bottom:24px}
 .week-col{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:8px 6px;cursor:pointer;transition:border-color 0.2s}
 .week-col:hover,.week-col.active{border-color:var(--accent)}
-.week-col.danger{border-color:rgba(255,107,107,0.5)}
-.week-col.danger .week-balance{color:var(--red)}
+.week-col.danger{border-color:rgba(255,107,107,0.5)}.week-col.danger .week-balance{color:var(--red)}
 .week-label{font-size:0.55rem;letter-spacing:0.08em;text-transform:uppercase;color:var(--muted);margin-bottom:6px;white-space:nowrap}
 .week-in{font-size:0.62rem;color:var(--green);margin-bottom:2px}
 .week-pipeline{font-size:0.58rem;color:var(--accent);margin-bottom:2px}
+.week-costs{font-size:0.58rem;color:var(--orange);margin-bottom:2px}
 .week-out{font-size:0.62rem;color:var(--red);margin-bottom:5px}
 .week-net{font-family:'Syne',sans-serif;font-size:0.78rem;font-weight:700;margin-bottom:3px}
 .week-balance{font-size:0.58rem;color:var(--muted);padding-top:4px;border-top:1px solid var(--border)}
@@ -741,10 +1182,11 @@ header{display:flex;align-items:flex-end;justify-content:space-between;margin-bo
 .detail-close{background:none;border:1px solid var(--border);color:var(--muted);padding:4px 10px;border-radius:4px;cursor:pointer;font-family:'DM Mono',monospace;font-size:0.65rem}
 .detail-cols{display:grid;grid-template-columns:1fr 1fr;gap:20px}
 .detail-section-title{font-size:0.62rem;letter-spacing:0.15em;text-transform:uppercase;color:var(--muted);margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid var(--border)}
-.detail-row{display:grid;grid-template-columns:auto 1fr auto auto;gap:8px;padding:7px 0;border-bottom:1px solid rgba(42,42,64,0.4);font-size:0.7rem;align-items:center}
+.detail-row{display:grid;grid-template-columns:auto 1fr auto auto;gap:8px;padding:7px 0;border-bottom:1px solid rgba(42,42,64,0.4);font-size:0.7rem;align-items:start}
 .detail-row:last-child{border-bottom:none}
 .dr-ref{color:var(--accent);font-size:0.62rem;white-space:nowrap}
-.dr-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dr-name{overflow:hidden}
+.dr-breakdown{font-size:0.58rem;color:var(--muted);margin-top:2px;line-height:1.5}
 .dr-amt{font-family:'Syne',sans-serif;font-weight:600;text-align:right;white-space:nowrap}
 .dr-type{font-size:0.55rem;padding:2px 6px;border-radius:3px;text-transform:uppercase;letter-spacing:0.06em;white-space:nowrap}
 .type-invoice{background:rgba(78,205,196,0.15);color:var(--accent2)}
@@ -753,12 +1195,13 @@ header{display:flex;align-items:flex-end;justify-content:space-between;margin-bo
 .type-weekly{background:rgba(124,106,247,0.15);color:var(--accent)}
 .type-confirmed{background:rgba(167,139,250,0.2);color:#a78bfa}
 .type-provisional{background:rgba(99,102,241,0.2);color:#818cf8}
+.type-cost{background:rgba(255,159,67,0.18);color:var(--orange)}
 .empty-state{font-size:0.7rem;color:var(--muted);padding:12px 0}
 .beyond-table{width:100%;border-collapse:collapse;font-size:0.7rem;margin-top:8px}
 .beyond-table th{text-align:left;font-size:0.58rem;letter-spacing:0.12em;text-transform:uppercase;color:var(--muted);padding:0 0 8px;border-bottom:1px solid var(--border);font-weight:400}
-.beyond-table td{padding:8px 0;border-bottom:1px solid rgba(42,42,64,0.4)}
+.beyond-table td{padding:8px 0;border-bottom:1px solid rgba(42,42,64,0.4);vertical-align:top}
 .beyond-table tr:last-child td{border-bottom:none}
-.beyond-scroll{max-height:300px;overflow-y:auto}
+.beyond-scroll{max-height:320px;overflow-y:auto}
 .beyond-scroll::-webkit-scrollbar{width:3px}
 .beyond-scroll::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
 .toggle-bar{display:flex;gap:8px;margin-bottom:16px;align-items:center;flex-wrap:wrap}
@@ -767,53 +1210,93 @@ header{display:flex;align-items:flex-end;justify-content:space-between;margin-bo
 .toggle-btn{background:var(--surface);border:1px solid var(--border);color:var(--muted);padding:7px 16px;border-radius:4px;cursor:pointer;font-family:'DM Mono',monospace;font-size:0.68rem;letter-spacing:0.08em;transition:all 0.2s}
 .toggle-btn:hover{border-color:var(--accent);color:var(--accent)}
 .toggle-btn.active{background:var(--accent);border-color:var(--accent);color:#fff}
+.toggle-btn.active-orange{background:var(--orange);border-color:var(--orange);color:#fff}
 .loading-overlay{display:flex;align-items:center;justify-content:center;height:300px}
 .loading-text{font-size:0.68rem;color:var(--muted);letter-spacing:0.1em;text-transform:uppercase;animation:pulse 1.5s ease-in-out infinite}
 .error-text{font-size:0.68rem;color:var(--red)}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
 @keyframes fadeUp{to{opacity:1;transform:translateY(0)}}
 @media(max-width:1100px){.week-grid{grid-template-columns:repeat(7,1fr)}}
-@media(max-width:700px){.kpi-row{grid-template-columns:repeat(2,1fr)}.week-grid{grid-template-columns:repeat(4,1fr)}.detail-cols{grid-template-columns:1fr}.pipeline-banner{grid-template-columns:1fr}}
+@media(max-width:700px){.kpi-row{grid-template-columns:repeat(2,1fr)}.week-grid{grid-template-columns:repeat(4,1fr)}.detail-cols{grid-template-columns:1fr}.pipeline-banner,.cost-banner{grid-template-columns:1fr 1fr}}
 </style>
 </head>
 <body>
 <div class="container">
   <header>
     <div class="logo-area"><h1>Forecast<span>.</span></h1><p>8-month cash flow — Xero + Sonderplan</p></div>
-    <a href="/dashboard" class="nav-link">← Dashboard</a>
+    <div class="nav-links">
+      <a href="/dashboard" class="nav-link">← Dashboard</a>
+      <a href="/settings" class="nav-link">⚙ Settings</a>
+    </div>
   </header>
   <div id="loading-state" class="loading-overlay"><div class="loading-text">Building forecast…</div></div>
   <div id="forecast-content" style="display:none">
     <div class="pipeline-banner">
       <div class="pipeline-stat"><div class="pipeline-stat-label">Confirmed Pipeline <span class="sp-badge">Sonderplan</span></div><div class="pipeline-stat-value positive" id="sp-confirmed">—</div></div>
       <div class="pipeline-stat"><div class="pipeline-stat-label">Provisional Pipeline <span class="sp-badge">Sonderplan</span></div><div class="pipeline-stat-value neutral" id="sp-provisional">—</div></div>
-      <div class="pipeline-stat"><div class="pipeline-stat-label">Pipeline Events This Year</div><div class="pipeline-stat-value neutral" id="sp-count">—</div></div>
+      <div class="pipeline-stat"><div class="pipeline-stat-label">Events in Forecast Window</div><div class="pipeline-stat-value neutral" id="sp-count">—</div></div>
+      <div class="pipeline-stat"><div class="pipeline-stat-label">Opening Balance</div><div class="pipeline-stat-value neutral" id="kpi-opening">—</div></div>
     </div>
-    <!-- Pipeline date toggle -->
+
+    <!-- Uninvoiced warnings — only shown if past events exist -->
+    <div id="uninvoiced-banner" style="display:none;margin-bottom:16px;padding:14px 18px;background:rgba(255,107,107,0.1);border:1px solid rgba(255,107,107,0.4);border-radius:8px">
+      <div style="display:flex;align-items:center;justify-content:space-between;cursor:pointer" onclick="toggleUninvoiced()">
+        <div>
+          <span style="font-family:'Syne',sans-serif;font-weight:700;font-size:0.85rem;color:var(--red)">⚠ Uninvoiced / Unresolved Events</span>
+          <span id="uninvoiced-summary" style="font-size:0.68rem;color:var(--muted);margin-left:12px"></span>
+        </div>
+        <span style="font-size:0.68rem;color:var(--muted)" id="uninvoiced-toggle-label">Show ▼</span>
+      </div>
+      <div id="uninvoiced-detail" style="display:none;margin-top:14px">
+        <div style="font-size:0.65rem;color:var(--muted);margin-bottom:10px;line-height:1.6">
+          These events have passed but are still <strong>Confirmed or Provisional</strong> in Sonderplan.
+          They are <strong>not included in any forecast figures</strong>.
+          Check whether an invoice has been raised and paid in Xero for each one.
+          Once the Xero invoice reference link is built, this list will reconcile automatically.
+        </div>
+        <table style="width:100%;border-collapse:collapse;font-size:0.7rem">
+          <thead>
+            <tr>
+              <th style="text-align:left;color:var(--muted);font-weight:400;padding:0 0 8px;border-bottom:1px solid var(--border)">Event</th>
+              <th style="text-align:left;color:var(--muted);font-weight:400;padding:0 0 8px;border-bottom:1px solid var(--border)">Status</th>
+              <th style="text-align:left;color:var(--muted);font-weight:400;padding:0 0 8px;border-bottom:1px solid var(--border)">Event Date</th>
+              <th style="text-align:right;color:var(--muted);font-weight:400;padding:0 0 8px;border-bottom:1px solid var(--border)">Value</th>
+              <th style="text-align:left;color:var(--muted);font-weight:400;padding:0 0 8px;border-bottom:1px solid var(--border)">Price Flag</th>
+            </tr>
+          </thead>
+          <tbody id="uninvoiced-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="cost-banner">
+      <div class="pipeline-stat"><div class="pipeline-stat-label">Est. Total Event Costs <span class="cost-badge">All pipeline</span></div><div class="pipeline-stat-value" style="color:var(--orange)" id="cost-total">—</div></div>
+      <div class="pipeline-stat"><div class="pipeline-stat-label">Est. Wages</div><div class="pipeline-stat-value" style="color:var(--orange)" id="cost-wages">—</div></div>
+      <div class="pipeline-stat"><div class="pipeline-stat-label">Est. Mileage</div><div class="pipeline-stat-value" style="color:var(--orange)" id="cost-mileage">—</div></div>
+      <div class="pipeline-stat"><div class="pipeline-stat-label">Est. Hotel + Subsistence</div><div class="pipeline-stat-value" style="color:var(--orange)" id="cost-hotel">—</div></div>
+    </div>
+
     <div class="toggle-bar">
       <span class="toggle-label">Pipeline by:</span>
       <button class="toggle-btn active" id="btn-payment" onclick="setMode('payment')">Payment Date</button>
       <button class="toggle-btn" id="btn-event" onclick="setMode('event')">Event Date</button>
-      <span style="font-size:0.62rem;color:var(--muted);margin-left:8px" id="toggle-hint">Showing when cash is expected (1 month before event)</span>
-    </div>
-
-    <div class="kpi-row">
-      <div class="kpi-card"><div class="kpi-label">Opening Balance</div><div class="kpi-value neutral" id="kpi-opening">—</div><div class="kpi-sub">This week</div></div>
-      <div class="kpi-card"><div class="kpi-label">Confirmed Inflows</div><div class="kpi-value positive" id="kpi-confirmed">—</div><div class="kpi-sub" id="kpi-confirmed-sub">Xero invoices due</div></div>
-      <div class="kpi-card"><div class="kpi-label">Pipeline in Window</div><div class="kpi-value neutral" id="kpi-pipeline">—</div><div class="kpi-sub" id="kpi-pipeline-sub">Sonderplan events</div></div>
-      <div class="kpi-card"><div class="kpi-label">Closing Balance</div><div class="kpi-value neutral" id="kpi-closing">—</div><div class="kpi-sub">End of month 8</div></div>
-    </div>
-    <!-- Best / worst case toggle -->
-    <div class="toggle-bar" style="margin-bottom:24px">
-      <span class="toggle-label">Chart view:</span>
+      <div class="toggle-divider"></div>
+      <span class="toggle-label">Case:</span>
       <button class="toggle-btn active" id="btn-best" onclick="setCaseMode('best')">Best Case</button>
       <button class="toggle-btn" id="btn-worst" onclick="setCaseMode('worst')">Confirmed Only</button>
       <div class="toggle-divider"></div>
-      <span style="font-size:0.62rem;color:var(--muted)" id="case-hint">Including confirmed + provisional pipeline</span>
+      <button class="toggle-btn active-orange" id="btn-costs-on" onclick="setCosts(true)">Costs On</button>
+      <button class="toggle-btn" id="btn-costs-off" onclick="setCosts(false)">Costs Off</button>
+    </div>
+
+    <div class="kpi-row">
+      <div class="kpi-card"><div class="kpi-label">Confirmed Inflows</div><div class="kpi-value positive" id="kpi-confirmed">—</div><div class="kpi-sub" id="kpi-confirmed-sub">Xero invoices</div></div>
+      <div class="kpi-card"><div class="kpi-label">Pipeline in Window</div><div class="kpi-value neutral" id="kpi-pipeline">—</div><div class="kpi-sub" id="kpi-pipeline-sub">Sonderplan events</div></div>
+      <div class="kpi-card"><div class="kpi-label">Est. Event Costs</div><div class="kpi-value" style="color:var(--orange)" id="kpi-costs">—</div><div class="kpi-sub" id="kpi-costs-sub">in forecast window</div></div>
+      <div class="kpi-card"><div class="kpi-label">Closing Balance</div><div class="kpi-value neutral" id="kpi-closing">—</div><div class="kpi-sub">End of week 34</div></div>
     </div>
 
     <div class="card">
-      <div class="card-header"><span class="card-title">Weekly Cash Position</span><span class="card-badge" id="chart-badge">8-month rolling forecast</span></div>
+      <div class="card-header"><span class="card-title">Weekly Cash Position</span><span class="card-badge" id="chart-badge">8-month rolling</span></div>
       <div class="chart-wrap"><canvas id="forecastChart"></canvas></div>
     </div>
     <div class="section-label" style="margin-top:8px">Weekly Breakdown — click any week for detail</div>
@@ -827,8 +1310,8 @@ header{display:flex;align-items:flex-end;justify-content:space-between;margin-bo
     </div>
     <div class="section-label">Pipeline Beyond Forecast Window</div>
     <div class="card">
-      <div class="card-header"><span class="card-title">Upcoming Events</span><span class="card-badge" id="beyond-badge">—</span></div>
-      <div class="beyond-scroll"><table class="beyond-table"><thead><tr><th>Event</th><th>Status</th><th>Event Date</th><th>Est. Payment</th><th style="text-align:right">Amount</th><th>Flag</th></tr></thead><tbody id="beyond-tbody"></tbody></table></div>
+      <div class="card-header"><span class="card-title">Upcoming Events (outside 34-week window)</span><span class="card-badge" id="beyond-badge">—</span></div>
+      <div class="beyond-scroll"><table class="beyond-table"><thead><tr><th>Event</th><th>Status</th><th>Event Date</th><th>Est. Payment</th><th>Units</th><th style="text-align:right">Est. Cost</th><th style="text-align:right">Income</th></tr></thead><tbody id="beyond-tbody"></tbody></table></div>
     </div>
   </div>
 </div>
@@ -836,134 +1319,522 @@ header{display:flex;align-items:flex-end;justify-content:space-between;margin-bo
 const fmt=n=>new Intl.NumberFormat('en-GB',{style:'currency',currency:'GBP',maximumFractionDigits:0}).format(n);
 const fmtDec=n=>new Intl.NumberFormat('en-GB',{style:'currency',currency:'GBP',minimumFractionDigits:2}).format(n);
 Chart.defaults.color='#6b6b8a';Chart.defaults.borderColor='#2a2a40';Chart.defaults.font.family="'DM Mono',monospace";Chart.defaults.font.size=11;
-let forecastData=null;
-function typeClass(t){if(t==='Invoice')return'type-invoice';if(t==='Bill')return'type-bill';if(t==='Est. Monthly')return'type-monthly';if(t==='Est. Weekly')return'type-weekly';if(t==='Confirmed Event')return'type-confirmed';return'type-provisional';}
+
+let forecastData = null;
+let currentMode  = 'payment';
+let currentCase  = 'best';
+let costsOn      = true;
+
+function toggleUninvoiced(){
+  const detail = document.getElementById('uninvoiced-detail');
+  const label  = document.getElementById('uninvoiced-toggle-label');
+  const open   = detail.style.display === 'none';
+  detail.style.display = open ? 'block' : 'none';
+  label.textContent    = open ? 'Hide ▲' : 'Show ▼';
+}
+
+function typeClass(t){
+  if(t==='Invoice')           return 'type-invoice';
+  if(t==='Bill')              return 'type-bill';
+  if(t==='Est. Monthly')      return 'type-monthly';
+  if(t==='Est. Weekly')       return 'type-weekly';
+  if(t==='Confirmed Event')   return 'type-confirmed';
+  if(t==='Est. Event Cost')   return 'type-cost';
+  return 'type-provisional';
+}
+
 function renderDetail(wi){
-  const week=forecastData.weeks[wi];
+  const week = forecastData._weeks[wi];
   document.querySelectorAll('.week-col').forEach((c,i)=>c.classList.toggle('active',i===wi));
-  const panel=document.getElementById('detail-panel');panel.classList.add('visible');
-  document.getElementById('detail-title').textContent=week.label+' ('+week.weekStart+' \\u2192 '+week.weekEnd+')';
-  const xeroIn=week.inflows.filter(i=>i.source==='xero'),spIn=week.inflows.filter(i=>i.source==='sonderplan');
-  document.getElementById('detail-in-title').textContent='Inflows \\u2014 '+fmt(week.totalIn)+(week.pipelineIn>0?' ('+fmt(week.confirmedIn)+' confirmed + '+fmt(week.pipelineIn)+' pipeline)':'');
-  const makeRow=i=>'<div class="detail-row"><span class="dr-ref">'+i.ref+'</span><span class="dr-name">'+i.contact+(i.priceFlag&&i.priceFlag!=='Clean'?' <span style="color:var(--muted);font-size:0.58rem">['+i.priceFlag+']</span>':'')+'</span><span class="dr-amt">'+fmtDec(i.amount)+'</span><span class="dr-type '+typeClass(i.type)+'">'+i.type+'</span></div>';
-  let inHtml='';
-  if(xeroIn.length){inHtml+='<div style="font-size:0.6rem;color:var(--muted);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:6px">Confirmed (Xero)</div>';inHtml+=xeroIn.map(makeRow).join('');}
-  if(spIn.length){inHtml+='<div style="font-size:0.6rem;color:var(--accent);letter-spacing:0.1em;text-transform:uppercase;margin:'+(xeroIn.length?'12px':'0')+'px 0 6px">Pipeline (Sonderplan)</div>';inHtml+=spIn.map(makeRow).join('');}
-  if(!inHtml)inHtml='<div class="empty-state">No inflows this week</div>';
-  document.getElementById('detail-inflows').innerHTML=inHtml;
-  document.getElementById('detail-out-title').textContent='Outflows \\u2014 '+fmt(week.totalOut);
-  document.getElementById('detail-outflows').innerHTML=week.outflows.length?week.outflows.map(makeRow).join(''):'<div class="empty-state">No outflows this week</div>';
+  const panel = document.getElementById('detail-panel');
+  panel.classList.add('visible');
+  document.getElementById('detail-title').textContent = week.label + ' (' + week.weekStart + ' \u2192 ' + week.weekEnd + ')';
+
+  const xeroIn = week.inflows.filter(i=>i.source==='xero');
+  const spIn   = week.inflows.filter(i=>i.source==='sonderplan');
+  document.getElementById('detail-in-title').textContent =
+    'Inflows \u2014 ' + fmt(week.totalIn) +
+    (week.pipelineIn > 0 ? ' (' + fmt(week.confirmedIn) + ' confirmed + ' + fmt(week.pipelineIn) + ' pipeline)' : '');
+
+  const makeInRow = i =>
+    '<div class="detail-row"><span class="dr-ref">' + i.ref + '</span>' +
+    '<div class="dr-name">' + i.contact + (i.priceFlag && i.priceFlag !== 'Clean' ? ' <span style="color:var(--muted);font-size:0.58rem">[' + i.priceFlag + ']</span>' : '') + '</div>' +
+    '<span class="dr-amt">' + fmtDec(i.amount) + '</span>' +
+    '<span class="dr-type ' + typeClass(i.type) + '">' + i.type + '</span></div>';
+
+  const makeCostRow = i =>
+    '<div class="detail-row"><span class="dr-ref">' + i.ref + '</span>' +
+    '<div class="dr-name">' + i.contact + '<div class="dr-breakdown">' + (i.breakdown||'') + '</div></div>' +
+    '<span class="dr-amt">' + fmtDec(i.amount) + '</span>' +
+    '<span class="dr-type type-cost">Est. Cost</span></div>';
+
+  let inHtml = '';
+  if(xeroIn.length){ inHtml += '<div style="font-size:0.6rem;color:var(--muted);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:6px">Confirmed (Xero)</div>' + xeroIn.map(makeInRow).join(''); }
+  if(spIn.length){   inHtml += '<div style="font-size:0.6rem;color:var(--accent);letter-spacing:0.1em;text-transform:uppercase;margin:' + (xeroIn.length?'12px':'0') + 'px 0 6px">Pipeline (Sonderplan)</div>' + spIn.map(makeInRow).join(''); }
+  if(!inHtml) inHtml = '<div class="empty-state">No inflows this week</div>';
+  document.getElementById('detail-inflows').innerHTML = inHtml;
+
+  const costOut  = week.outflows.filter(o=>o.source==='staff-estimate');
+  const otherOut = week.outflows.filter(o=>o.source!=='staff-estimate');
+  const costSum  = costOut.reduce((a,o)=>a+o.amount,0);
+  document.getElementById('detail-out-title').textContent =
+    'Outflows \u2014 ' + fmt(week.totalOut) +
+    (costSum > 0 ? ' (incl. ' + fmt(costSum) + ' est. costs)' : '');
+
+  let outHtml = '';
+  if(otherOut.length){ outHtml += otherOut.map(o => o.source==='staff-estimate' ? makeCostRow(o) : makeInRow(o)).join(''); }
+  if(costOut.length){  outHtml += '<div style="font-size:0.6rem;color:var(--orange);letter-spacing:0.1em;text-transform:uppercase;margin:' + (otherOut.length?'12px':'0') + 'px 0 6px">Est. Event Costs</div>' + costOut.map(makeCostRow).join(''); }
+  document.getElementById('detail-outflows').innerHTML = outHtml || '<div class="empty-state">No outflows this week</div>';
+
   panel.scrollIntoView({behavior:'smooth',block:'nearest'});
 }
-function closeDetail(){document.getElementById('detail-panel').classList.remove('visible');document.querySelectorAll('.week-col').forEach(c=>c.classList.remove('active'));}
-let currentMode = 'payment'; // 'payment' or 'event'
-let currentCase  = 'best';    // 'best' (all pipeline) or 'worst' (confirmed only)
 
-function setMode(mode) {
-  currentMode = mode;
-  document.getElementById('btn-payment').classList.toggle('active', mode==='payment');
-  document.getElementById('btn-event').classList.toggle('active', mode==='event');
-  document.getElementById('toggle-hint').textContent = mode==='payment'
-    ? 'Showing when cash is expected (1 month before event)'
-    : 'Showing when the event actually happens';
-  if (forecastData) rebuildWithMode(forecastData, mode);
+function closeDetail(){
+  document.getElementById('detail-panel').classList.remove('visible');
+  document.querySelectorAll('.week-col').forEach(c=>c.classList.remove('active'));
 }
 
-function setCaseMode(mode) {
-  currentCase = mode;
-  document.getElementById('btn-best').classList.toggle('active', mode==='best');
-  document.getElementById('btn-worst').classList.toggle('active', mode==='worst');
-  document.getElementById('case-hint').textContent = mode==='best'
-    ? 'Including confirmed + provisional pipeline'
-    : 'Confirmed pipeline only — provisional excluded';
-  document.getElementById('chart-badge').textContent = mode==='best'
-    ? '8-month rolling forecast — best case'
-    : '8-month rolling forecast — confirmed only';
-  if (forecastData) rebuildWithMode(forecastData, currentMode);
+function setMode(m){ currentMode=m; document.getElementById('btn-payment').classList.toggle('active',m==='payment'); document.getElementById('btn-event').classList.toggle('active',m==='event'); if(forecastData)rebuild(); }
+function setCaseMode(m){ currentCase=m; document.getElementById('btn-best').classList.toggle('active',m==='best'); document.getElementById('btn-worst').classList.toggle('active',m==='worst'); if(forecastData)rebuild(); }
+function setCosts(on){ costsOn=on; document.getElementById('btn-costs-on').className='toggle-btn '+(on?'active-orange':''); document.getElementById('btn-costs-off').className='toggle-btn '+(on?'':'active-orange'); if(forecastData)rebuild(); }
+
+function getWeekIndex(dateStr, forecastFrom){
+  return Math.floor((new Date(dateStr).getTime() - new Date(forecastFrom).getTime()) / (86400000*7));
 }
 
-function getWeekIndex(dateStr, forecastFrom) {
-  const d = new Date(dateStr);
-  const start = new Date(forecastFrom);
-  return Math.floor((d.getTime() - start.getTime()) / (86400000 * 7));
-}
+function rebuild(){
+  const data  = forecastData;
+  const weeks = JSON.parse(JSON.stringify(data.weeks));
 
-function rebuildWithMode(data, mode) {
-  const weeks = JSON.parse(JSON.stringify(data.weeks)); // deep copy
-  // Clear pipeline from all weeks
-  for (const w of weeks) {
-    w.inflows    = w.inflows.filter(i => i.source !== 'sonderplan');
-    w.totalIn    = w.inflows.reduce((a,i) => a+i.amount, 0) + w.confirmedIn;
-    w.pipelineIn = 0;
+  // Strip all sonderplan contributions, re-add based on current mode/case/costs
+  for(const w of weeks){
+    w.inflows  = w.inflows.filter(i => i.source !== 'sonderplan');
+    w.outflows = w.outflows.filter(o => o.source !== 'staff-estimate');
+    w.totalIn  = w.inflows.reduce((a,i)=>a+i.amount, 0);
+    w.totalOut = w.outflows.reduce((a,o)=>a+o.amount, 0);
+    w.pipelineIn = 0; w.estimatedCosts = 0;
   }
-  // Re-bucket pipeline items using selected date and case mode
-  const allItems = (data.pipeline.allItems || []).filter(item => {
-    if (currentCase === 'worst') return item.status === 'Confirmed';
-    return true; // best case: include all
-  });
-  for (const item of allItems) {
-    const dateStr = mode === 'event' ? item.eventStart : item.paymentDate;
-    const wi = getWeekIndex(dateStr, data.forecastFrom);
-    if (wi < 0 || wi >= 34) continue;
-    weeks[wi].inflows.push({
-      ref: item.id, contact: item.name, amount: item.price,
-      due: dateStr, type: item.status === 'Confirmed' ? 'Confirmed Event' : 'Provisional Event',
-      source: 'sonderplan', status: item.status, priceFlag: item.priceFlag,
-    });
-    weeks[wi].totalIn    += item.price;
-    weeks[wi].pipelineIn += item.price;
+
+  const items = (data.pipeline.allItems || []).filter(p => currentCase === 'best' || p.status === 'Confirmed');
+
+  for(const item of items){
+    const inDate = currentMode === 'event' ? item.eventStart : item.paymentDate;
+    const wiIn   = getWeekIndex(inDate, data.forecastFrom);
+    if(wiIn >= 0 && wiIn < 34){
+      weeks[wiIn].inflows.push({ ref:item.id, contact:item.name, amount:item.price, due:inDate,
+        type: item.status==='Confirmed' ? 'Confirmed Event' : 'Provisional Event',
+        source:'sonderplan', status:item.status, priceFlag:item.priceFlag });
+      weeks[wiIn].totalIn    += item.price;
+      weeks[wiIn].pipelineIn += item.price;
+    }
+    if(costsOn && item.costs && item.costs.total > 0){
+      const wiCost = getWeekIndex(item.eventStart, data.forecastFrom);
+      if(wiCost >= 0 && wiCost < 34){
+        weeks[wiCost].outflows.push({ ref:item.id, contact:item.name, amount:item.costs.total,
+          due:item.eventStart, type:'Est. Event Cost', source:'staff-estimate',
+          unitCount:item.unitCount, eventDays:item.eventDays,
+          miles:item.costs.miles, nights:item.costs.nights, breakdown:item.costs.breakdown });
+        weeks[wiCost].totalOut        += item.costs.total;
+        weeks[wiCost].estimatedCosts  += item.costs.total;
+      }
+    }
   }
-  // Recalculate net and running balance
+
   let running = data.openingBalance;
-  for (const w of weeks) {
-    w.net = w.totalIn - w.totalOut;
-    running += w.net;
-    w.runningBalance = running;
-  }
-  // Ensure content is visible before rendering chart
-  document.getElementById('loading-state').style.display='none';
-  document.getElementById('forecast-content').style.display='block';
-  renderForecast(data, weeks);
+  for(const w of weeks){ w.net = w.totalIn - w.totalOut; running += w.net; w.runningBalance = running; }
+
+  // Stash for detail panel access
+  data._weeks = weeks;
+
+  renderChart(data, weeks);
+  renderWeekGrid(data, weeks);
+  renderKPIs(data, weeks);
+}
+
+function renderKPIs(data, weeks){
+  const confirmedIn  = weeks.reduce((a,w)=>a+w.confirmedIn, 0);
+  const pipelineIn   = weeks.reduce((a,w)=>a+w.pipelineIn, 0);
+  const estimCosts   = weeks.reduce((a,w)=>a+w.estimatedCosts, 0);
+  const closing      = weeks[weeks.length-1].runningBalance;
+
+  document.getElementById('kpi-opening').textContent  = fmt(data.openingBalance);
+  document.getElementById('kpi-opening').className    = 'pipeline-stat-value ' + (data.openingBalance>=0?'positive':'negative');
+  document.getElementById('kpi-confirmed').textContent = fmt(confirmedIn);
+  document.getElementById('kpi-confirmed-sub').textContent = weeks.reduce((a,w)=>a+w.inflows.filter(i=>i.source==='xero').length,0) + ' invoices';
+  document.getElementById('kpi-pipeline').textContent  = fmt(pipelineIn);
+  document.getElementById('kpi-pipeline-sub').textContent  = weeks.reduce((a,w)=>a+w.inflows.filter(i=>i.source==='sonderplan').length,0) + ' events in window';
+  document.getElementById('kpi-costs').textContent    = fmt(estimCosts);
+  document.getElementById('kpi-costs-sub').textContent = costsOn ? 'est. event costs shown' : 'costs hidden';
+  const clEl = document.getElementById('kpi-closing'); clEl.textContent = fmt(closing); clEl.className = 'kpi-value ' + (closing>=0?'positive':'negative');
+}
+
+function renderChart(data, weeks){
+  if(window._fChart) window._fChart.destroy();
+  window._fChart = new Chart(document.getElementById('forecastChart').getContext('2d'), {
+    type:'bar',
+    data:{
+      labels: weeks.map(w=>w.label),
+      datasets:[
+        {label:'Confirmed In (Xero)',  data:weeks.map(w=>w.confirmedIn),    backgroundColor:'rgba(78,205,196,0.75)', borderRadius:0, borderSkipped:false, stack:'in'},
+        {label:'Pipeline In (SP)',     data:weeks.map(w=>w.pipelineIn),     backgroundColor:'rgba(124,106,247,0.6)', borderRadius:3, borderSkipped:false, stack:'in'},
+        {label:'Est. Event Costs',     data:weeks.map(w=>w.estimatedCosts), backgroundColor:'rgba(255,159,67,0.7)',  borderRadius:0, borderSkipped:false, stack:'out'},
+        {label:'Other Outflows',       data:weeks.map(w=>w.totalOut-w.estimatedCosts), backgroundColor:'rgba(255,107,107,0.65)', borderRadius:3, borderSkipped:false, stack:'out'},
+        {label:'Balance', data:weeks.map(w=>w.runningBalance), type:'line',
+          borderColor:'#ffd93d', backgroundColor:'rgba(255,217,61,0.05)', borderWidth:2,
+          pointRadius:3, pointBackgroundColor:weeks.map(w=>w.runningBalance>=0?'#ffd93d':'#ff6b6b'),
+          fill:true, tension:0.3, yAxisID:'y1', stack:undefined},
+      ]
+    },
+    options:{
+      responsive:true, maintainAspectRatio:false, interaction:{mode:'index'},
+      plugins:{
+        legend:{display:true,position:'bottom',labels:{boxWidth:10,padding:12}},
+        tooltip:{callbacks:{afterBody:items=>{const wi=items[0].dataIndex; return ['Net: '+fmt(weeks[wi].net),' Conf: '+fmt(weeks[wi].confirmedIn),' Pipeline: '+fmt(weeks[wi].pipelineIn),' Est.Costs: '+fmt(weeks[wi].estimatedCosts)];}}}
+      },
+      scales:{
+        x:{grid:{color:'#2a2a40'}},
+        y:{grid:{color:'#2a2a40'}, ticks:{callback:v=>fmt(v)}, title:{display:true,text:'In / Out',color:'#6b6b8a',font:{size:10}}, stacked:true},
+        y1:{position:'right', grid:{display:false}, ticks:{callback:v=>fmt(v)}, title:{display:true,text:'Balance',color:'#6b6b8a',font:{size:10}}},
+      }
+    }
+  });
+}
+
+function renderWeekGrid(data, weeks){
+  document.getElementById('week-grid').innerHTML = weeks.map((w,i)=>{
+    const danger   = w.runningBalance < 0;
+    const netClass = w.net > 0 ? 'net-positive' : w.net < 0 ? 'net-negative' : 'net-zero';
+    return '<div class="week-col'+(danger?' danger':'')+'" onclick="renderDetail('+i+')">' +
+      '<div class="week-label">'+w.label+'</div>' +
+      '<div class="week-in">\u2191 '+fmt(w.confirmedIn)+'</div>' +
+      (w.pipelineIn>0 ? '<div class="week-pipeline">\u25C6 '+fmt(w.pipelineIn)+'</div>' : '') +
+      (w.estimatedCosts>0 ? '<div class="week-costs">\u25BC '+fmt(w.estimatedCosts)+'</div>' : '') +
+      '<div class="week-out">\u2193 '+fmt(w.totalOut)+'</div>' +
+      '<div class="week-net '+netClass+'">'+(w.net>=0?'+':'')+fmt(w.net)+'</div>' +
+      '<div class="week-balance">Bal '+fmt(w.runningBalance)+'</div></div>';
+  }).join('');
 }
 
 async function loadForecast(){
   try{
-    const res=await fetch('/api/forecast');if(!res.ok)throw new Error(await res.text());
-    forecastData=await res.json();
-    // Show content and render via rebuildWithMode so toggles work correctly
-    rebuildWithMode(forecastData, currentMode);
-  }catch(e){document.getElementById('loading-state').innerHTML='<div class="error-text">Error: '+e.message+'</div>';}
+    const res = await fetch('/api/forecast');
+    if(!res.ok) throw new Error(await res.text());
+    forecastData = await res.json();
+    document.getElementById('loading-state').style.display = 'none';
+    document.getElementById('forecast-content').style.display = 'block';
+
+    // Pipeline banner
+    document.getElementById('sp-confirmed').textContent  = fmt(forecastData.pipeline.confirmedTotal);
+    document.getElementById('sp-provisional').textContent = fmt(forecastData.pipeline.provisionalTotal);
+    document.getElementById('sp-count').textContent       = forecastData.pipeline.inWindowCount + ' events';
+
+    // Uninvoiced warnings banner
+    const warnings = forecastData.uninvoicedWarnings || [];
+    if(warnings.length > 0){
+      document.getElementById('uninvoiced-banner').style.display = 'block';
+      document.getElementById('uninvoiced-summary').textContent =
+        warnings.length + ' event' + (warnings.length===1?'':'s') + ' — ' +
+        fmt(forecastData.uninvoicedTotalValue) + ' total value — not in forecast figures';
+      const statusBadge = s => '<span style="font-size:0.6rem;padding:2px 6px;border-radius:3px;background:rgba(255,107,107,0.15);color:var(--red)">'+s+'</span>';
+      const flagColour  = f => f==='Clean'?'var(--green)':f==='No Quote'?'var(--red)':'var(--accent4)';
+      document.getElementById('uninvoiced-tbody').innerHTML = warnings.map(p =>
+        '<tr>' +
+        '<td style="padding:7px 0;border-bottom:1px solid rgba(42,42,64,0.4)">'+p.name+'</td>' +
+        '<td style="padding:7px 0;border-bottom:1px solid rgba(42,42,64,0.4)">'+statusBadge(p.status)+'</td>' +
+        '<td style="padding:7px 0;border-bottom:1px solid rgba(42,42,64,0.4);color:var(--muted)">'+p.eventStart+' → '+p.eventEnd+'</td>' +
+        '<td style="padding:7px 0;border-bottom:1px solid rgba(42,42,64,0.4);text-align:right;font-family:Syne,sans-serif;font-weight:600">'+fmtDec(p.price)+'</td>' +
+        '<td style="padding:7px 0;border-bottom:1px solid rgba(42,42,64,0.4);color:'+flagColour(p.priceFlag)+';font-size:0.62rem;padding-left:12px">'+p.priceFlag+'</td>' +
+        '</tr>'
+      ).join('');
+    }
+
+    // Cost banner — aggregate over all pipeline items
+    const allItems = forecastData.pipeline.allItems || [];
+    const totalCosts     = allItems.reduce((a,p)=>a+(p.costs?.total||0), 0);
+    const totalWages     = allItems.reduce((a,p)=>a+(p.costs?.wages||0), 0);
+    const totalMileage   = allItems.reduce((a,p)=>a+(p.costs?.mileage||0), 0);
+    const totalHotelSubs = allItems.reduce((a,p)=>a+(p.costs?.hotel||0)+(p.costs?.subsistence||0), 0);
+    document.getElementById('cost-total').textContent    = fmt(totalCosts);
+    document.getElementById('cost-wages').textContent    = fmt(totalWages);
+    document.getElementById('cost-mileage').textContent  = fmt(totalMileage);
+    document.getElementById('cost-hotel').textContent    = fmt(totalHotelSubs);
+
+    // Beyond window table
+    const beyond = forecastData.pipeline.beyondWindow || [];
+    document.getElementById('beyond-badge').textContent = beyond.length + ' events';
+    const statusBadge = s => '<span style="font-size:0.6rem;padding:2px 6px;border-radius:3px;background:rgba(124,106,247,0.15);color:var(--accent)">'+s+'</span>';
+    document.getElementById('beyond-tbody').innerHTML = beyond.length
+      ? beyond.map(p=>'<tr><td>'+p.name+'</td><td>'+statusBadge(p.status)+'</td><td>'+p.eventStart+'</td><td>'+p.paymentDate+'</td><td style="color:var(--muted)">'+p.unitCount+'u</td><td style="text-align:right;color:var(--orange)">'+fmt(p.costs?.total||0)+'</td><td style="text-align:right;font-family:Syne,sans-serif;font-weight:600">'+fmtDec(p.price)+'</td></tr>').join('')
+      : '<tr><td colspan="7" style="color:var(--muted);padding:12px 0">No events beyond the forecast window</td></tr>';
+
+    rebuild();
+
+    // Auto-open first active week
+    const firstActive = (forecastData._weeks||[]).findIndex(w=>w.inflows.length>0||w.outflows.length>0);
+    if(firstActive >= 0) renderDetail(firstActive);
+
+  } catch(e){
+    document.getElementById('loading-state').innerHTML = '<div class="error-text">Error: '+e.message+'</div>';
+  }
 }
 
-function renderForecast(data, weeks) {
-  const forecastData = data; // local alias
-    const totalConfirmedIn=weeks.reduce((a,w)=>a+w.confirmedIn,0);
-    const totalPipelineIn=weeks.reduce((a,w)=>a+w.pipelineIn,0);
-    const closing=weeks[weeks.length-1].runningBalance;
-    document.getElementById('sp-confirmed').textContent=fmt(forecastData.pipeline.confirmedTotal);
-    document.getElementById('sp-provisional').textContent=fmt(forecastData.pipeline.provisionalTotal);
-    document.getElementById('sp-count').textContent=forecastData.pipeline.itemCount+' events ('+forecastData.pipeline.inWindowCount+' in window)';
-    const opEl=document.getElementById('kpi-opening');opEl.textContent=fmt(forecastData.openingBalance);opEl.className='kpi-value '+(forecastData.openingBalance>=0?'positive':'negative');
-    document.getElementById('kpi-confirmed').textContent=fmt(totalConfirmedIn);
-    document.getElementById('kpi-confirmed-sub').textContent=weeks.reduce((a,w)=>a+w.inflows.filter(i=>i.source==='xero').length,0)+' invoice items';
-    document.getElementById('kpi-pipeline').textContent=fmt(totalPipelineIn);
-    document.getElementById('kpi-pipeline').style.color = currentCase==='worst' ? 'var(--accent2)' : '';
-    document.getElementById('kpi-pipeline-sub').textContent=weeks.reduce((a,w)=>a+w.inflows.filter(i=>i.source==='sonderplan').length,0)+' pipeline events in window';
-    const clEl=document.getElementById('kpi-closing');clEl.textContent=fmt(closing);clEl.className='kpi-value '+(closing>=0?'positive':'negative');
-    if(window._forecastChart) window._forecastChart.destroy();
-    window._forecastChart = new Chart(document.getElementById('forecastChart').getContext('2d'),{type:'bar',data:{labels:weeks.map(w=>w.label),datasets:[{label:'Confirmed In (Xero)',data:weeks.map(w=>w.confirmedIn),backgroundColor:'rgba(78,205,196,0.75)',borderRadius:0,borderSkipped:false,stack:'in'},{label:'Pipeline In (Sonderplan)',data:weeks.map(w=>w.pipelineIn),backgroundColor:'rgba(124,106,247,0.6)',borderRadius:3,borderSkipped:false,stack:'in'},{label:'Outflows',data:weeks.map(w=>w.totalOut),backgroundColor:'rgba(255,107,107,0.65)',borderRadius:3,borderSkipped:false,stack:'out'},{label:'Balance',data:weeks.map(w=>w.runningBalance),type:'line',borderColor:'#ffd93d',backgroundColor:'rgba(255,217,61,0.05)',borderWidth:2,pointRadius:4,pointBackgroundColor:weeks.map(w=>w.runningBalance>=0?'#ffd93d':'#ff6b6b'),fill:true,tension:0.3,yAxisID:'y1',stack:undefined}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index'},plugins:{legend:{display:true,position:'bottom',labels:{boxWidth:10,padding:12}},tooltip:{callbacks:{afterBody:items=>{const wi=items[0].dataIndex;return['Net: '+fmt(weeks[wi].net),'  Confirmed: '+fmt(weeks[wi].confirmedIn),'  Pipeline: '+fmt(weeks[wi].pipelineIn)];}}}},scales:{x:{grid:{color:'#2a2a40'}},y:{grid:{color:'#2a2a40'},ticks:{callback:v=>fmt(v)},title:{display:true,text:'In / Out',color:'#6b6b8a',font:{size:10}},stacked:true},y1:{position:'right',grid:{display:false},ticks:{callback:v=>fmt(v)},title:{display:true,text:'Balance',color:'#6b6b8a',font:{size:10}}}}}});
-    document.getElementById('week-grid').innerHTML=weeks.map((w,i)=>{const danger=w.runningBalance<0;const netClass=w.net>0?'net-positive':w.net<0?'net-negative':'net-zero';return'<div class="week-col'+(danger?' danger':'')+'" onclick="renderDetail('+i+')"><div class="week-label">'+w.label+'</div><div class="week-in">\\u2191 '+fmt(w.confirmedIn)+'</div>'+(w.pipelineIn>0?'<div class="week-pipeline">\\u25C6 '+fmt(w.pipelineIn)+'</div>':'')+'<div class="week-out">\\u2193 '+fmt(w.totalOut)+'</div><div class="week-net '+netClass+'">'+(w.net>=0?'+':'')+fmt(w.net)+'</div><div class="week-balance">Bal '+fmt(w.runningBalance)+'</div></div>';}).join('');
-    const firstActive=weeks.findIndex(w=>w.inflows.length>0||w.outflows.length>0);
-    if(firstActive>=0)renderDetail(firstActive);
-    const beyond=forecastData.pipeline.beyondWindow||[];
-    document.getElementById('beyond-badge').textContent=beyond.length+' events';
-    const flagColour=f=>f==='Clean'?'var(--green)':f==='FOC'?'var(--muted)':f==='No Quote'?'var(--red)':'var(--accent4)';
-    document.getElementById('beyond-tbody').innerHTML=beyond.length
-      ?beyond.map(p=>'<tr><td>'+p.name+'</td><td><span style="font-size:0.6rem;padding:2px 6px;border-radius:3px;background:rgba(124,106,247,0.15);color:var(--accent)">'+p.status+'</span></td><td>'+p.eventStart+'</td><td>'+p.paymentDate+'</td><td style="text-align:right;font-family:Syne,sans-serif;font-weight:600">'+fmtDec(p.price)+'</td><td style="color:'+flagColour(p.priceFlag)+';font-size:0.62rem">'+p.priceFlag+'</td></tr>').join('')
-      :'<tr><td colspan="6" style="color:var(--muted);padding:12px 0">No pipeline events beyond the forecast window</td></tr>';
-} // end renderForecast
-
 loadForecast();
+</script>
+</body></html>
+`;
+
+// ─── Settings HTML ─────────────────────────────────────────────────────────────
+const SETTINGS_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cost Settings</title>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#0a0a0f;--surface:#12121a;--surface2:#1a1a26;--border:#2a2a40;--accent:#7c6af7;--text:#e8e8f0;--muted:#6b6b8a;--green:#51cf66;--red:#ff6b6b;--orange:#ff9f43}
+body{background:var(--bg);color:var(--text);font-family:'DM Mono',monospace;min-height:100vh}
+body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(var(--border) 1px,transparent 1px),linear-gradient(90deg,var(--border) 1px,transparent 1px);background-size:40px 40px;opacity:0.25;pointer-events:none;z-index:0}
+.container{position:relative;z-index:1;max-width:800px;margin:0 auto;padding:40px 32px}
+header{display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:40px;padding-bottom:24px;border-bottom:1px solid var(--border)}
+.logo-area h1{font-family:'Syne',sans-serif;font-size:2rem;font-weight:800;letter-spacing:-0.03em}
+.logo-area h1 span{color:var(--accent)}
+.logo-area p{font-size:0.7rem;color:var(--muted);margin-top:4px;letter-spacing:0.1em;text-transform:uppercase}
+.nav-links{display:flex;gap:8px}
+.nav-link{font-size:0.68rem;color:var(--accent);text-decoration:none;letter-spacing:0.08em;border:1px solid var(--accent);padding:5px 12px;border-radius:4px;transition:all 0.2s}
+.nav-link:hover{background:var(--accent);color:#fff}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:28px;margin-bottom:20px}
+.card-title{font-family:'Syne',sans-serif;font-size:0.85rem;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;margin-bottom:6px}
+.card-desc{font-size:0.68rem;color:var(--muted);margin-bottom:24px;line-height:1.6}
+.field-group{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.field-group-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px}
+.field{margin-bottom:0}
+.field-label{font-size:0.62rem;letter-spacing:0.12em;text-transform:uppercase;color:var(--muted);margin-bottom:8px;display:block}
+.field-hint{font-size:0.6rem;color:var(--muted);margin-top:4px;opacity:0.7}
+input[type="text"],input[type="number"]{background:var(--surface2);border:1px solid var(--border);color:var(--text);font-family:'DM Mono',monospace;font-size:0.85rem;padding:10px 14px;border-radius:5px;width:100%;transition:border-color 0.2s;outline:none}
+input:focus{border-color:var(--accent)}
+.toggle-row{display:flex;align-items:center;gap:16px;padding:14px 0;border-bottom:1px solid var(--border)}
+.toggle-row:last-child{border-bottom:none}
+.toggle-label-col{flex:1}
+.toggle-label-col strong{font-size:0.82rem;display:block;margin-bottom:3px}
+.toggle-label-col span{font-size:0.65rem;color:var(--muted)}
+.toggle{position:relative;width:44px;height:24px;flex-shrink:0}
+.toggle input{opacity:0;width:0;height:0}
+.slider{position:absolute;inset:0;background:var(--border);border-radius:12px;cursor:pointer;transition:0.2s}
+.slider::before{content:'';position:absolute;width:18px;height:18px;left:3px;top:3px;background:#fff;border-radius:50%;transition:0.2s}
+input:checked+.slider{background:var(--accent)}
+input:checked+.slider::before{transform:translateX(20px)}
+.btn-row{display:flex;gap:12px;align-items:center;margin-top:28px;padding-top:24px;border-top:1px solid var(--border)}
+.btn-save{background:var(--orange);border:none;color:#fff;font-family:'DM Mono',monospace;font-size:0.75rem;font-weight:500;letter-spacing:0.1em;padding:12px 28px;border-radius:5px;cursor:pointer;text-transform:uppercase;transition:opacity 0.2s}
+.btn-save:hover{opacity:0.85}
+.btn-save:disabled{opacity:0.4;cursor:not-allowed}
+.btn-reset{background:none;border:1px solid var(--border);color:var(--muted);font-family:'DM Mono',monospace;font-size:0.68rem;padding:10px 18px;border-radius:5px;cursor:pointer;letter-spacing:0.08em;text-transform:uppercase;transition:all 0.2s}
+.btn-reset:hover{border-color:var(--accent);color:var(--accent)}
+.status-msg{font-size:0.7rem;padding:8px 14px;border-radius:4px;display:none}
+.status-msg.ok{background:rgba(81,207,102,0.12);color:var(--green);border:1px solid rgba(81,207,102,0.3)}
+.status-msg.err{background:rgba(255,107,107,0.12);color:var(--red);border:1px solid rgba(255,107,107,0.3)}
+.loading-text{font-size:0.68rem;color:var(--muted);letter-spacing:0.1em;text-transform:uppercase;animation:pulse 1.5s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
+@media(max-width:600px){.field-group,.field-group-3{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <div class="logo-area"><h1>Settings<span>.</span></h1><p>Cost estimation assumptions</p></div>
+    <div class="nav-links">
+      <a href="/dashboard" class="nav-link">Dashboard</a>
+      <a href="/forecast" class="nav-link">Forecast</a>
+    </div>
+  </header>
+
+  <div id="loading-msg" class="loading-text" style="margin-bottom:20px">Loading current settings…</div>
+
+  <div id="settings-form" style="display:none">
+    <div class="card">
+      <div class="card-title">Base Location & Travel</div>
+      <div class="card-desc">Where vehicles are based, and how driving time and mileage are calculated.</div>
+      <div class="field-group" style="margin-bottom:16px">
+        <div class="field">
+          <label class="field-label">Base postcode</label>
+          <input id="basePostcode" type="text" placeholder="GL10 3RF">
+          <div class="field-hint">Geocoded via postcodes.io — changing this clears the distance cache</div>
+        </div>
+        <div class="field">
+          <label class="field-label">Driving speed (mph)</label>
+          <input id="drivingSpeedMph" type="number" step="5" min="10" placeholder="40">
+          <div class="field-hint">Used to convert distance → driving hours paid. 40mph recommended for vans/trailers.</div>
+        </div>
+      </div>
+      <div class="field-group">
+        <div class="field">
+          <label class="field-label">Mileage rate (£/mile)</label>
+          <input id="mileageRatePerMile" type="number" step="0.01" min="0" placeholder="0.45">
+          <div class="field-hint">HMRC approved: £0.45/mile — applied to return trip × units</div>
+        </div>
+        <div class="field">
+          <label class="field-label">Hotel threshold (miles)</label>
+          <input id="hotelThresholdMiles" type="number" step="5" min="0" placeholder="50">
+          <div class="field-hint">Hotel added if one-way distance exceeds this, or event is multi-day</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Staff Costs</div>
+      <div class="card-desc">1 staff per unit. Paid hours = operational hours + driving time (return) + setup/breakdown + contingency.</div>
+      <div class="field-group" style="margin-bottom:16px">
+        <div class="field">
+          <label class="field-label">Hourly rate (£)</label>
+          <input id="hourlyRate" type="number" step="0.50" min="0" placeholder="12.50">
+          <div class="field-hint">Rate per staff member per paid hour</div>
+        </div>
+        <div class="field">
+          <label class="field-label">Contingency hours (per event)</label>
+          <input id="contingencyHours" type="number" step="0.5" min="0" placeholder="1">
+          <div class="field-hint">Added to every event regardless of resource type</div>
+        </div>
+      </div>
+      <div class="field-group-3">
+        <div class="field">
+          <label class="field-label">Day Van setup (hours)</label>
+          <input id="setup_DayVan" type="number" step="0.5" min="0" placeholder="1">
+          <div class="field-hint">Resources starting "Day Van"</div>
+        </div>
+        <div class="field">
+          <label class="field-label">Trailer setup (hours)</label>
+          <input id="setup_Trailer" type="number" step="0.5" min="0" placeholder="4">
+          <div class="field-hint">Resources starting "Trailer"</div>
+        </div>
+        <div class="field">
+          <label class="field-label">POD setup (hours)</label>
+          <input id="setup_POD" type="number" step="0.5" min="0" placeholder="4">
+          <div class="field-hint">Resources starting "POD"</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Accommodation & Subsistence</div>
+      <div class="card-desc">Per staff per night/day.</div>
+      <div class="field-group">
+        <div class="field">
+          <label class="field-label">Hotel nightly cost (£)</label>
+          <input id="hotelNightlyCost" type="number" step="5" min="0" placeholder="80">
+        </div>
+        <div class="field">
+          <label class="field-label">Subsistence daily rate (£)</label>
+          <input id="subsistenceDailyRate" type="number" step="1" min="0" placeholder="5">
+          <div class="field-hint">HMRC benchmark: £5/day</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Employment Status</div>
+      <div class="card-desc">Currently all drivers are treated as self-employed. Enable PAYE to add employer on-costs to wage calculations.</div>
+      <div class="toggle-row">
+        <div class="toggle-label-col">
+          <strong>PAYE mode</strong>
+          <span>Applies on-cost multiplier to all wage calculations globally</span>
+        </div>
+        <label class="toggle"><input type="checkbox" id="payeMode"><span class="slider"></span></label>
+      </div>
+      <div style="margin-top:16px">
+        <div class="field">
+          <label class="field-label">PAYE on-cost multiplier</label>
+          <input id="payeOnCostMultiplier" type="number" step="0.01" min="1" placeholder="1.258">
+          <div class="field-hint">Default 1.258 = employer NI 13.8% + holiday pay 12.07%. Only applied when PAYE mode is on.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="btn-row">
+      <button class="btn-save" id="btn-save" onclick="saveSettings()">Save Settings</button>
+      <button class="btn-reset" onclick="resetDefaults()">Reset to Defaults</button>
+      <span class="status-msg" id="status-msg"></span>
+    </div>
+  </div>
+</div>
+<script>
+const DEFAULTS = {
+  basePostcode:'GL10 3RF', hourlyRate:12.50, mileageRatePerMile:0.45,
+  hotelThresholdMiles:50, hotelNightlyCost:80, subsistenceDailyRate:5,
+  drivingSpeedMph:40, setupHours:{'Day Van':1,'Trailer':4,'POD':4},
+  contingencyHours:1, payeMode:false, payeOnCostMultiplier:1.258
+};
+
+function populate(s){
+  document.getElementById('basePostcode').value           = s.basePostcode        || DEFAULTS.basePostcode;
+  document.getElementById('hourlyRate').value             = s.hourlyRate          ?? DEFAULTS.hourlyRate;
+  document.getElementById('mileageRatePerMile').value     = s.mileageRatePerMile  ?? DEFAULTS.mileageRatePerMile;
+  document.getElementById('hotelThresholdMiles').value    = s.hotelThresholdMiles ?? DEFAULTS.hotelThresholdMiles;
+  document.getElementById('hotelNightlyCost').value       = s.hotelNightlyCost    ?? DEFAULTS.hotelNightlyCost;
+  document.getElementById('subsistenceDailyRate').value   = s.subsistenceDailyRate ?? DEFAULTS.subsistenceDailyRate;
+  document.getElementById('drivingSpeedMph').value        = s.drivingSpeedMph     ?? DEFAULTS.drivingSpeedMph;
+  document.getElementById('contingencyHours').value       = s.contingencyHours    ?? DEFAULTS.contingencyHours;
+  document.getElementById('payeOnCostMultiplier').value   = s.payeOnCostMultiplier ?? DEFAULTS.payeOnCostMultiplier;
+  document.getElementById('payeMode').checked             = !!s.payeMode;
+  const sh = s.setupHours || DEFAULTS.setupHours;
+  document.getElementById('setup_DayVan').value  = sh['Day Van'] ?? 1;
+  document.getElementById('setup_Trailer').value = sh['Trailer'] ?? 4;
+  document.getElementById('setup_POD').value     = sh['POD']     ?? 4;
+}
+
+function gather(){
+  return {
+    basePostcode:         document.getElementById('basePostcode').value.trim(),
+    hourlyRate:           parseFloat(document.getElementById('hourlyRate').value),
+    mileageRatePerMile:   parseFloat(document.getElementById('mileageRatePerMile').value),
+    hotelThresholdMiles:  parseFloat(document.getElementById('hotelThresholdMiles').value),
+    hotelNightlyCost:     parseFloat(document.getElementById('hotelNightlyCost').value),
+    subsistenceDailyRate: parseFloat(document.getElementById('subsistenceDailyRate').value),
+    drivingSpeedMph:      parseFloat(document.getElementById('drivingSpeedMph').value),
+    contingencyHours:     parseFloat(document.getElementById('contingencyHours').value),
+    payeOnCostMultiplier: parseFloat(document.getElementById('payeOnCostMultiplier').value),
+    payeMode:             document.getElementById('payeMode').checked,
+    setupHours: {
+      'Day Van':  parseFloat(document.getElementById('setup_DayVan').value),
+      'Trailer':  parseFloat(document.getElementById('setup_Trailer').value),
+      'POD':      parseFloat(document.getElementById('setup_POD').value),
+    },
+  };
+}
+
+function showStatus(msg, ok){
+  const el = document.getElementById('status-msg');
+  el.textContent = msg; el.className = 'status-msg ' + (ok?'ok':'err'); el.style.display='block';
+  if(ok) setTimeout(()=>{ el.style.display='none'; }, 3000);
+}
+
+async function saveSettings(){
+  const btn = document.getElementById('btn-save');
+  btn.disabled = true; btn.textContent = 'Saving…';
+  try{
+    const res = await fetch('/api/settings',{ method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(gather()) });
+    const data = await res.json();
+    if(data.ok){ showStatus('Saved \u2014 forecast will use new values on next load', true); }
+    else { showStatus('Save failed \u2014 check worker logs', false); }
+  } catch(e){ showStatus('Error: '+e.message, false); }
+  btn.disabled = false; btn.textContent = 'Save Settings';
+}
+
+function resetDefaults(){ populate(DEFAULTS); }
+
+async function init(){
+  try{
+    const res = await fetch('/api/settings');
+    const data = await res.json();
+    document.getElementById('loading-msg').style.display='none';
+    document.getElementById('settings-form').style.display='block';
+    populate(data);
+  } catch(e){
+    document.getElementById('loading-msg').textContent='Error loading settings: '+e.message;
+    document.getElementById('loading-msg').style.color='var(--red)';
+    document.getElementById('loading-msg').style.animation='none';
+  }
+}
+init();
 </script>
 </body></html>
 `;
