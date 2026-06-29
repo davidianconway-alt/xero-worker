@@ -49,6 +49,8 @@ interface PipelineItem {
   id: string;
   name: string;
   status: string;
+  isPast: boolean;
+  isPaid: boolean;
   eventStart: string;
   eventEnd: string;
   eventDays: number;
@@ -338,7 +340,7 @@ async function fetchSonderplanPipeline(
   costSettings: CostSettings,
   requirePrice: boolean = true   // set false for all-events endpoint
 ): Promise<PipelineItem[]> {
-  const PIPELINE_STATUSES = new Set(["Confirmed", "Provisional"]);
+  const PIPELINE_STATUSES = new Set(["Confirmed", "Provisional", "PAID", "Info Complete & Invoiced"]);
   const EXCLUDED_STATUSES = new Set(["Cancelled", "Passed on", "Unavailable", "Waiting List", "Set up/ Pack down/Travel"]);
 
   const headers = {
@@ -381,8 +383,17 @@ async function fetchSonderplanPipeline(
   for (const row of allRows) {
     if (row.deleted) continue;
 
-    const status = row.status?.[0]?.name || "";
-    if (!status || !PIPELINE_STATUSES.has(status)) continue;
+    const statusRaw = row.status?.[0]?.name || "";
+    // Normalise — Sonderplan may return different casing or descriptions
+    const status = statusRaw.trim();
+    const statusLower = status.toLowerCase();
+    const isPipelineStatus =
+      PIPELINE_STATUSES.has(status) ||
+      statusLower === "paid" ||
+      statusLower === "invoiced" ||
+      statusLower.includes("info complete") ||
+      statusLower.includes("confirmed");
+    if (!status || !isPipelineStatus) continue;
     if (EXCLUDED_STATUSES.has(status)) continue;
 
     const resources    = row.resources || [];
@@ -432,6 +443,8 @@ async function fetchSonderplanPipeline(
       id:              `${row.id}`,
       name:            row.name,
       status,
+      isPast:          eventStart < new Date(),
+      isPaid:          statusLower === "paid" || statusLower === "invoiced",
       eventStart:      toISO(eventStart),
       eventEnd:        toISO(eventEnd),
       eventDays,
