@@ -92,13 +92,28 @@ async function geocodePostcode(postcode: string): Promise<{ lat: number; lng: nu
   const key = postcode.trim().toUpperCase().replace(/\s+/g, "");
   if (geocodeCache.has(key)) return geocodeCache.get(key)!;
   try {
+    // Try full postcode first
     const res = await fetch(`https://api.postcodes.io/postcodes/${encodeURIComponent(key)}`);
-    if (!res.ok) { geocodeCache.set(key, null); return null; }
-    const data: any = await res.json();
-    if (data.status !== 200 || !data.result) { geocodeCache.set(key, null); return null; }
-    const result = { lat: data.result.latitude, lng: data.result.longitude };
-    geocodeCache.set(key, result);
-    return result;
+    if (res.ok) {
+      const data: any = await res.json();
+      if (data.status === 200 && data.result) {
+        const result = { lat: data.result.latitude, lng: data.result.longitude };
+        geocodeCache.set(key, result);
+        return result;
+      }
+    }
+    // Fall back to outcode endpoint (e.g. GL10, SW1A) — returns district centroid
+    const outcodeRes = await fetch(`https://api.postcodes.io/outcodes/${encodeURIComponent(key)}`);
+    if (outcodeRes.ok) {
+      const outcodeData: any = await outcodeRes.json();
+      if (outcodeData.status === 200 && outcodeData.result) {
+        const result = { lat: outcodeData.result.latitude, lng: outcodeData.result.longitude };
+        geocodeCache.set(key, result);
+        return result;
+      }
+    }
+    geocodeCache.set(key, null);
+    return null;
   } catch {
     geocodeCache.set(key, null);
     return null;
@@ -117,8 +132,32 @@ function kmToMiles(km: number): number { return km * 0.621371; }
 
 // Extract the first UK-looking postcode from a freetext address
 function extractPostcode(address: string): string | null {
-  const match = address.match(/\b([A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2})\b/i);
-  return match ? match[1].trim() : null;
+  if (!address) return null;
+
+  // Strip what3words patterns first (///word.word.word or w3w links)
+  const cleaned = address
+    .replace(/\/\/\/[\w]+\.[\w]+\.[\w]+/g, "")
+    .replace(/https?:\/\/(www\.)?(what3words\.com|w3w\.co)\/[\w.]+/gi, "")
+    .replace(/what3words:?\s*[\w./]*/gi, "")
+    .replace(/w3w:?\s*[\w./]*/gi, "")
+    .trim();
+
+  // Full UK postcode: e.g. GL10 3RF, SW1A 1AA, B40 1PP, WC2E 7BB
+  const fullMatch = cleaned.match(/\b([A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2})\b/i);
+  if (fullMatch) return fullMatch[1].replace(/\s+/g, " ").trim();
+
+  // Outward code only: e.g. GL10, SW1A, B40 — try to geocode the district
+  const outwardMatch = cleaned.match(/\b([A-Z]{1,2}\d{1,2}[A-Z]?)\b/i);
+  if (outwardMatch) return outwardMatch[1].trim();
+
+  return null;
+}
+
+// Driving hours: fix divide by zero if drivingSpeedMph is 0 or missing
+function calcDrivingHours(miles: number, speedMph: number): number {
+  if (miles <= 0) return 0;
+  const speed = speedMph && speedMph > 0 ? speedMph : 40; // safe fallback
+  return (miles * 2) / speed;
 }
 
 // Parse "10 hours", "10h", "10:00", "8-10" → decimal hours
@@ -195,7 +234,7 @@ async function estimateEventCosts(
   }
 
   // Driving hours: return trip at configured speed, per unit (each drives separately)
-  const drivingHoursPerUnit = miles > 0 ? (miles * 2) / settings.drivingSpeedMph : 0;
+  const drivingHoursPerUnit = calcDrivingHours(miles, settings.drivingSpeedMph);
   const totalDrivingHours   = drivingHoursPerUnit * unitCount;
 
   // Setup/breakdown hours from resource types + contingency
