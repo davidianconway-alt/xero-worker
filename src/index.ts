@@ -47,6 +47,7 @@ interface EventCosts {
 
 interface PipelineItem {
   id: string;
+  bookingId: string;          // original SP booking ID (shared across multi-unit rows)
   name: string;
   status: string;
   isPast: boolean;
@@ -55,13 +56,15 @@ interface PipelineItem {
   eventEnd: string;
   eventDays: number;
   paymentDate: string;
-  price: number;
+  price: number | null;
   priceFlag: string;
   rawPrice: string | null;
   unitCount: number;
-  resourceTypes: string[];   // names of active Mobiloo resources, e.g. ["Day Van (Adam)", "Trailer (Holly)"]
+  resourceTypes: string[];
   address: string | null;
-  operationalHours: number | null;
+  operationalHours: number | null;  // total (per-day x days)
+  opHoursPerDay: number | null;
+  opHoursSource: string;
   costs: EventCosts;
 }
 
@@ -92,7 +95,6 @@ async function geocodePostcode(postcode: string): Promise<{ lat: number; lng: nu
   const key = postcode.trim().toUpperCase().replace(/\s+/g, "");
   if (geocodeCache.has(key)) return geocodeCache.get(key)!;
   try {
-    // Try full postcode first
     const res = await fetch(`https://api.postcodes.io/postcodes/${encodeURIComponent(key)}`);
     if (res.ok) {
       const data: any = await res.json();
@@ -102,7 +104,7 @@ async function geocodePostcode(postcode: string): Promise<{ lat: number; lng: nu
         return result;
       }
     }
-    // Fall back to outcode endpoint (e.g. GL10, SW1A) — returns district centroid
+    // Fall back to outcode endpoint for partial postcodes
     const outcodeRes = await fetch(`https://api.postcodes.io/outcodes/${encodeURIComponent(key)}`);
     if (outcodeRes.ok) {
       const outcodeData: any = await outcodeRes.json();
@@ -117,6 +119,35 @@ async function geocodePostcode(postcode: string): Promise<{ lat: number; lng: nu
   } catch {
     geocodeCache.set(key, null);
     return null;
+  }
+}
+
+// Bulk geocode up to 100 postcodes in one request — avoids rate limiting
+async function bulkGeocodePostcodes(postcodes: string[]): Promise<void> {
+  const unique = [...new Set(postcodes.map(p => p.trim().toUpperCase().replace(/\s+/g, "")))];
+  const toFetch = unique.filter(p => p && !geocodeCache.has(p));
+  if (toFetch.length === 0) return;
+
+  // Process in batches of 100 (postcodes.io bulk limit)
+  for (let i = 0; i < toFetch.length; i += 100) {
+    const batch = toFetch.slice(i, i + 100);
+    try {
+      const res = await fetch("https://api.postcodes.io/postcodes", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ postcodes: batch }),
+      });
+      if (!res.ok) continue;
+      const data: any = await res.json();
+      for (const item of (data.result || [])) {
+        const key = (item.query || "").toUpperCase().replace(/\s+/g, "");
+        if (item.result) {
+          geocodeCache.set(key, { lat: item.result.latitude, lng: item.result.longitude });
+        } else {
+          geocodeCache.set(key, null);
+        }
+      }
+    } catch { /* continue */ }
   }
 }
 
@@ -419,6 +450,18 @@ async function fetchSonderplanPipeline(
     return null;
   };
 
+  // Pre-warm geocode cache in one bulk request to avoid postcodes.io rate limiting
+  const allPostcodes: string[] = [costSettings.basePostcode];
+  for (const row of allRows) {
+    if (row.deleted) continue;
+    const cf = row.custom_fields || [];
+    const addr = cf.find((f: any) =>
+      ["address","venue address","event address","location"].includes((f.name || "").toLowerCase())
+    )?.value || null;
+    if (addr) { const pc = extractPostcode(addr); if (pc) allPostcodes.push(pc); }
+  }
+  await bulkGeocodePostcodes(allPostcodes);
+
   for (const row of allRows) {
     if (row.deleted) continue;
 
@@ -465,38 +508,77 @@ async function fetchSonderplanPipeline(
     const equipmentRaw  = getField(cf, "Equipment", "Resources", "Units", "Vehicles");
     const opHoursRaw    = getField(cf, "Operational Hours", "Op Hours", "Hours", "Event Hours");
 
-    const unitCount        = countUnitsFromEquipment(equipmentRaw, mobilooRes.length);
-    const operationalHours = parseOperationalHours(opHoursRaw);
+    // Op hours from Sonderplan are per-day -- multiply by event days for total
+    const opHoursPerDay         = parseOperationalHours(opHoursRaw);
+    const operationalHoursTotal = opHoursPerDay !== null ? opHoursPerDay * eventDays : null;
+    const opHoursSource         = opHoursPerDay !== null ? "Sonderplan" : "Fallback";
 
-    // Resource type names for setup hour lookup — use Sonderplan resource names directly
+    // Resource type names for setup hour lookup -- use Sonderplan resource names directly
     const resourceTypeNames: string[] = mobilooRes.map((r: any) => (r.name || "").trim()).filter(Boolean);
-
-    const costs = await estimateEventCosts(addressRaw, unitCount, resourceTypeNames, operationalHours, eventDays, costSettings);
 
     const paymentDate = new Date(eventStart);
     paymentDate.setMonth(paymentDate.getMonth() - 1);
-    // Note: we no longer skip past payment dates — all Confirmed/Provisional events are returned
-    // so that the full year view works. The forecast weekly buckets handle future bucketing.
 
-    pipeline.push({
-      id:              `${row.id}`,
-      name:            row.name,
-      status,
-      isPast:          eventStart < new Date(),
-      isPaid:          statusLower === "paid" || statusLower === "invoiced",
-      eventStart:      toISO(eventStart),
-      eventEnd:        toISO(eventEnd),
-      eventDays,
-      paymentDate:     toISO(paymentDate),
-      price:           parsed.price,
-      priceFlag:       parsed.flag,
-      rawPrice,
-      unitCount,
-      resourceTypes:   resourceTypeNames,
-      address:         addressRaw,
-      operationalHours,
-      costs,
-    });
+    const isPast = eventStart < new Date();
+    const isPaid = statusLower === "paid" || statusLower === "invoiced";
+
+    if (resourceTypeNames.length <= 1) {
+      // Single unit -- one row
+      const costs = await estimateEventCosts(addressRaw, 1, resourceTypeNames, operationalHoursTotal, eventDays, costSettings);
+      pipeline.push({
+        id:               `${row.id}`,
+        bookingId:        `${row.id}`,
+        name:             row.name,
+        status, isPast, isPaid,
+        eventStart:       toISO(eventStart),
+        eventEnd:         toISO(eventEnd),
+        eventDays,
+        paymentDate:      toISO(paymentDate),
+        price:            parsed.price,
+        priceFlag:        parsed.flag,
+        rawPrice,
+        unitCount:        Math.max(resourceTypeNames.length, 1),
+        resourceTypes:    resourceTypeNames,
+        address:          addressRaw,
+        operationalHours: operationalHoursTotal,
+        opHoursPerDay,
+        opHoursSource,
+        costs,
+      });
+    } else {
+      // Multiple units -- one row per resource, op hours shared equally, price split equally
+      const sharedOpHours = operationalHoursTotal !== null
+        ? operationalHoursTotal / resourceTypeNames.length
+        : null;
+      const multiFlag = (parsed.flag ? parsed.flag + " | " : "") + "Shared op hours";
+
+      for (let i = 0; i < resourceTypeNames.length; i++) {
+        const resourceName = resourceTypeNames[i];
+        // Price stays on first row only — booking-level figure, can't be split meaningfully per unit
+        const unitPrice    = i === 0 ? parsed.price : null;
+        const costs = await estimateEventCosts(addressRaw, 1, [resourceName], sharedOpHours, eventDays, costSettings);
+        pipeline.push({
+          id:               `${row.id}-${i}`,
+          bookingId:        `${row.id}`,
+          name:             row.name,
+          status, isPast, isPaid,
+          eventStart:       toISO(eventStart),
+          eventEnd:         toISO(eventEnd),
+          eventDays,
+          paymentDate:      toISO(paymentDate),
+          price:            unitPrice,
+          priceFlag:        multiFlag,
+          rawPrice,
+          unitCount:        1,
+          resourceTypes:    [resourceName],
+          address:          addressRaw,
+          operationalHours: sharedOpHours,
+          opHoursPerDay,
+          opHoursSource,
+          costs,
+        });
+      }
+    }
   }
 
   return pipeline;
