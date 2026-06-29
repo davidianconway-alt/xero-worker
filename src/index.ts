@@ -335,7 +335,8 @@ async function fetchSonderplanPipeline(
   token: string,
   fromTime: number,
   toTime: number,
-  costSettings: CostSettings
+  costSettings: CostSettings,
+  requirePrice: boolean = true   // set false for all-events endpoint
 ): Promise<PipelineItem[]> {
   const PIPELINE_STATUSES = new Set(["Confirmed", "Provisional"]);
   const EXCLUDED_STATUSES = new Set(["Cancelled", "Passed on", "Unavailable", "Waiting List", "Set up/ Pack down/Travel"]);
@@ -346,9 +347,9 @@ async function fetchSonderplanPipeline(
     "Content-Type": "application/json",
   };
 
-  // Always fetch from start of current year so past confirmed/provisional events are included
-  const yearStart = new Date(new Date().getFullYear(), 0, 1);
-  const effectiveFrom = Math.min(fromTime, Math.floor(yearStart.getTime() / 1000));
+  // Use the passed fromTime directly — callers are responsible for setting the right start date
+  // For forecast: starts today. For all-events: starts Jan 1.
+  const effectiveFrom = fromTime;
 
   let allRows: any[] = [];
   let page = 1;
@@ -396,8 +397,10 @@ async function fetchSonderplanPipeline(
     const cf = row.custom_fields || [];
     const rawPrice = getField(cf, "Quoted Price");
     const parsed   = parseQuotedPrice(rawPrice);
-    if (parsed.flag === "Complex" || parsed.flag === "No Quote") continue;
-    if (parsed.price === null || parsed.price === 0) continue;
+    if (requirePrice) {
+      if (parsed.flag === "Complex" || parsed.flag === "No Quote") continue;
+      if (parsed.price === null || parsed.price === 0) continue;
+    }
 
     const eventStart = row.start ? new Date(row.start * 1000) : null;
     if (!eventStart) continue;
@@ -461,11 +464,14 @@ export default {
     if (path === "/settings")              return serveSettings();
     if (path === "/api/cashflow")          return handleCashflow(env);
     if (path === "/api/invoices")          return callXeroAPI(env, '/Invoices?where=Status%3D%3D%22AUTHORISED%22&order=DueDate+ASC');
+    if (path === "/api/bills")             return callXeroAPI(env, '/Invoices?where=Status%3D%3D%22AUTHORISED%22%26%26Type%3D%3D%22ACCPAY%22&order=DueDate+ASC');
     if (path === "/api/invoices-by-month") return handleInvoicesByMonth(env);
     if (path === "/api/cashburn")          return handleCashBurn(env);
     if (path === "/api/bankbalance")       return handleBankBalance(env);
+    if (path === "/api/bankdebug")         return handleBankDebug(env);
     if (path === "/api/pnl")               return handleProfitAndLoss(env);
     if (path === "/api/forecast")          return handleForecast(env);
+    if (path === "/api/events/all")        return handleAllEvents(env);
     if (path === "/api/pipeline")          return handlePipeline(env);
     if (path === "/api/sp-debug")          return handleSpDebug(env);
     if (path === "/api/settings") {
@@ -483,7 +489,8 @@ function redirectToXero(env: Env): Response {
     response_type: "code", response_mode: "query", client_id: env.XERO_CLIENT_ID,
     redirect_uri: env.XERO_REDIRECT_URI,
     scope: ["openid","profile","email","offline_access","accounting.invoices","accounting.payments",
-      "accounting.banktransactions","accounting.manualjournals","accounting.settings"].join(" "),
+      "accounting.banktransactions","accounting.manualjournals","accounting.settings",
+      "accounting.reports.read"].join(" "),
   });
   return Response.redirect(`${XERO_AUTH_URL}?${params}`, 302);
 }
@@ -557,6 +564,24 @@ async function handlePipeline(env: Env): Promise<Response> {
   } catch (e: any) { return new Response("Sonderplan error: " + e.message, { status: 500 }); }
 }
 
+async function handleAllEvents(env: Env): Promise<Response> {
+  if (!env.SONDERPLAN_TOKEN) return new Response("SONDERPLAN_TOKEN not configured", { status: 500 });
+  const settings  = await getCostSettings(env);
+  const yearStart = Math.floor(new Date(new Date().getFullYear(), 0, 1).getTime() / 1000);
+  const yearEnd   = Math.floor(new Date(new Date().getFullYear(), 11, 31, 23, 59, 59).getTime() / 1000);
+  try {
+    const events = await fetchSonderplanPipeline(env.SONDERPLAN_TOKEN, yearStart, yearEnd, settings, false);
+    return Response.json({
+      year: new Date().getFullYear(),
+      count: events.length,
+      generatedAt: new Date().toISOString(),
+      events,
+    }, { headers: { "Access-Control-Allow-Origin": "*" } });
+  } catch (e: any) {
+    return new Response("Error: " + e.message, { status: 500 });
+  }
+}
+
 async function handleSpDebug(env: Env): Promise<Response> {
   const tokenCheck = {
     hasToken:    !!env.SONDERPLAN_TOKEN,
@@ -580,11 +605,11 @@ async function handleSpDebug(env: Env): Promise<Response> {
   let parsed: any  = null;
   try { parsed = JSON.parse(rawText); } catch {}
 
-  // Collect every custom field name seen on page 1 — tells us the exact field names to use
-  const customFieldNamesSeen = new Set<string>();
+  // Collect every custom field name AND id seen on page 1
+  const customFieldsSeen = new Map<string, number>();
   for (const row of (parsed?.data || [])) {
     for (const cf of (row.custom_fields || [])) {
-      if (cf.name) customFieldNamesSeen.add(cf.name);
+      if (cf.name && cf.id) customFieldsSeen.set(cf.name, cf.id);
     }
   }
 
@@ -597,7 +622,7 @@ async function handleSpDebug(env: Env): Promise<Response> {
     rawTextPreview: rawText.substring(0, 800),
     meta: parsed?.meta || null,
     total_rows_page1: parsed?.data?.length || 0,
-    custom_field_names_seen: Array.from(customFieldNamesSeen),
+    custom_fields_seen: Object.fromEntries(customFieldsSeen), // { "Field Name": id }
     first_booking: parsed?.data?.[0] ? {
       id:            parsed.data[0].id,
       name:          parsed.data[0].name,
@@ -812,48 +837,109 @@ async function handleForecast(env: Env): Promise<Response> {
   }, { headers: { "Access-Control-Allow-Origin": "*" } });
 }
 
+async function handleBankDebug(env: Env): Promise<Response> {
+  let tokens: XeroTokens;
+  try { tokens = await getValidTokens(env); } catch (e: any) { return new Response(e.message, { status: 401 }); }
+  const h = { Authorization: `Bearer ${tokens.access_token}`, "Xero-tenant-id": tokens.tenant_id, Accept: "application/json" };
+
+  // Fetch all bank accounts and return raw response so we can see what fields are present
+  const res = await fetch(`${XERO_API_BASE}/Accounts?where=Type%3D%3D%22BANK%22`, { headers: h });
+  const raw = await res.text();
+  let parsed: any = null;
+  try { parsed = JSON.parse(raw); } catch {}
+
+  // Also try fetching first account individually
+  let singleRaw = null;
+  const firstId = parsed?.Accounts?.[0]?.AccountID;
+  if (firstId) {
+    const sr = await fetch(`${XERO_API_BASE}/Accounts/${firstId}`, { headers: h });
+    singleRaw = await sr.json();
+  }
+
+  return Response.json({
+    status: res.status,
+    accountCount: parsed?.Accounts?.length || 0,
+    // Show all fields on first account so we can see what's available
+    firstAccountAllFields: parsed?.Accounts?.[0] || null,
+    singleAccountFetch: singleRaw?.Accounts?.[0] || null,
+  }, { headers: { "Access-Control-Allow-Origin": "*" } });
+}
+
 async function handleBankBalance(env: Env): Promise<Response> {
   let tokens: XeroTokens;
   try { tokens = await getValidTokens(env); } catch (e: any) { return new Response(e.message, { status: 401 }); }
-  const res = await fetch(`${XERO_API_BASE}/Accounts?where=Type%3D%3D%22BANK%22`, {
-    headers: { Authorization: `Bearer ${tokens.access_token}`, "Xero-tenant-id": tokens.tenant_id, Accept: "application/json" },
-  });
-  if (!res.ok) return new Response("Failed: " + await res.text(), { status: 500 });
-  const data: any = await res.json();
-  const accounts = (data.Accounts || []).map((a: any) => ({
-    name:           a.Name,
-    code:           a.Code,
-    currencyBalance: a.CurrencyCode,
-    balance:        a.ReportingCodeUpdatedDateUTC ? null : (a.Balance ?? null),
-    // Balance field isn't always present on Accounts endpoint — use BankSummary fallback
-  }));
-  // Xero Accounts endpoint doesn't reliably return Balance — use Reports/BankSummary instead
-  const rptRes = await fetch(`${XERO_API_BASE}/Reports/BankSummary`, {
-    headers: { Authorization: `Bearer ${tokens.access_token}`, "Xero-tenant-id": tokens.tenant_id, Accept: "application/json" },
-  });
-  if (!rptRes.ok) {
-    // Fallback: sum what we have from Accounts
-    const total = accounts.reduce((a: number, acc: any) => a + (acc.balance ?? 0), 0);
-    return Response.json({ total, accounts, source: "accounts-endpoint" }, { headers: { "Access-Control-Allow-Origin": "*" } });
-  }
-  const rptData: any = await rptRes.json();
-  // BankSummary report structure: Rows → Row → Cells with balance data
-  let total = 0;
-  const bankAccounts: { name: string; balance: number }[] = [];
-  for (const section of rptData.Reports?.[0]?.Rows || []) {
-    for (const row of section.Rows || []) {
-      const cells = row.Cells || [];
-      if (cells.length >= 2) {
-        const name    = cells[0]?.Value || "";
-        const balance = parseFloat((cells[cells.length - 1]?.Value || "0").replace(/[^0-9.-]/g, ""));
-        if (name && !isNaN(balance)) {
-          bankAccounts.push({ name, balance });
-          total += balance;
-        }
-      }
+  const h = { Authorization: `Bearer ${tokens.access_token}`, "Xero-tenant-id": tokens.tenant_id, Accept: "application/json" };
+
+  // Strategy 1: Accounts endpoint with EnablePaymentsToAccount filter
+  // Xero returns Balance on bank accounts when fetched individually or with correct params
+  const accRes = await fetch(`${XERO_API_BASE}/Accounts?where=Type%3D%3D%22BANK%22%26%26EnablePaymentsToAccount%3D%3Dtrue`, { headers: h });
+  if (accRes.ok) {
+    const accData: any = await accRes.json();
+    const bankAccounts = (accData.Accounts || [])
+      .filter((a: any) => typeof a.Balance === "number")
+      .map((a: any) => ({ name: a.Name, balance: a.Balance as number }));
+    const total = bankAccounts.reduce((sum: number, a: any) => sum + a.balance, 0);
+    if (bankAccounts.length > 0) {
+      return Response.json({ total, accounts: bankAccounts, source: "accounts-endpoint" },
+        { headers: { "Access-Control-Allow-Origin": "*" } });
     }
   }
-  return Response.json({ total, accounts: bankAccounts, source: "bank-summary-report" },
+
+  // Strategy 2: Fetch all bank accounts individually — Balance field appears on single-account fetch
+  const allAccRes = await fetch(`${XERO_API_BASE}/Accounts?where=Type%3D%3D%22BANK%22`, { headers: h });
+  if (allAccRes.ok) {
+    const allAccData: any = await allAccRes.json();
+    const ids: string[] = (allAccData.Accounts || []).map((a: any) => a.AccountID).filter(Boolean);
+    const bankAccounts: { name: string; balance: number }[] = [];
+    for (const id of ids) {
+      const singleRes = await fetch(`${XERO_API_BASE}/Accounts/${id}`, { headers: h });
+      if (!singleRes.ok) continue;
+      const singleData: any = await singleRes.json();
+      const acc = singleData.Accounts?.[0];
+      if (acc && typeof acc.Balance === "number") {
+        bankAccounts.push({ name: acc.Name, balance: acc.Balance });
+      }
+    }
+    const total = bankAccounts.reduce((sum, a) => sum + a.balance, 0);
+    if (bankAccounts.length > 0) {
+      return Response.json({ total, accounts: bankAccounts, source: "accounts-individual" },
+        { headers: { "Access-Control-Allow-Origin": "*" } });
+    }
+  }
+
+  // Strategy 3: BalanceSheet report
+  const today = new Date().toISOString().substring(0, 10);
+  const bsRes = await fetch(`${XERO_API_BASE}/Reports/BalanceSheet?date=${today}`, { headers: h });
+  if (bsRes.ok) {
+    const bsData: any = await bsRes.json();
+    const bankAccounts: { name: string; balance: number }[] = [];
+    let total = 0;
+    const walkRows = (rows: any[]) => {
+      for (const row of rows || []) {
+        if (row.RowType === "Section" && row.Title?.toLowerCase().includes("bank")) {
+          for (const r of row.Rows || []) {
+            if (r.RowType === "Row" && r.Cells?.length >= 2) {
+              const name = r.Cells[0]?.Value || "";
+              const balance = parseFloat((r.Cells[r.Cells.length-1]?.Value || "0").replace(/[^0-9.-]/g, ""));
+              if (name && !isNaN(balance) && name !== "Bank accounts") {
+                bankAccounts.push({ name, balance }); total += balance;
+              }
+            }
+          }
+        }
+        if (row.Rows) walkRows(row.Rows);
+      }
+    };
+    walkRows(bsData.Reports?.[0]?.Rows || []);
+    if (bankAccounts.length > 0) {
+      return Response.json({ total, accounts: bankAccounts, source: "balance-sheet-report" },
+        { headers: { "Access-Control-Allow-Origin": "*" } });
+    }
+  }
+
+  // All strategies failed
+  return Response.json({ total: null, accounts: [], source: "unavailable",
+    note: "Could not retrieve bank balance — Xero account may need accounting.reports.read scope" },
     { headers: { "Access-Control-Allow-Origin": "*" } });
 }
 
@@ -966,7 +1052,6 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Financial Dashboard</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@300;400;500&display=swap" rel="stylesheet">
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
@@ -988,8 +1073,8 @@ header{display:flex;align-items:flex-end;justify-content:space-between;margin-bo
 .kpi-row{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:32px}
 .kpi-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:24px;position:relative;overflow:hidden;opacity:0;transform:translateY(8px);animation:fadeUp 0.4s ease forwards}
 .kpi-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px}
-.kpi-card:nth-child(1){animation-delay:0.05s}.kpi-card:nth-child(1)::before{background:var(--accent)}
-.kpi-card:nth-child(2){animation-delay:0.10s}.kpi-card:nth-child(2)::before{background:var(--accent2)}
+.kpi-card:nth-child(1){animation-delay:0.05s}.kpi-card:nth-child(1)::before{background:var(--accent2)}
+.kpi-card:nth-child(2){animation-delay:0.10s}.kpi-card:nth-child(2)::before{background:var(--accent)}
 .kpi-card:nth-child(3){animation-delay:0.15s}.kpi-card:nth-child(3)::before{background:var(--accent3)}
 .kpi-card:nth-child(4){animation-delay:0.20s}.kpi-card:nth-child(4)::before{background:var(--accent4)}
 .kpi-label{font-size:0.62rem;letter-spacing:0.15em;text-transform:uppercase;color:var(--muted);margin-bottom:12px}
@@ -997,18 +1082,14 @@ header{display:flex;align-items:flex-end;justify-content:space-between;margin-bo
 .kpi-sub{font-size:0.68rem;color:var(--muted);margin-top:8px}
 .positive{color:var(--green)}.negative{color:var(--red)}.neutral{color:var(--text)}
 .section-label{font-size:0.62rem;letter-spacing:0.18em;text-transform:uppercase;color:var(--muted);margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--border)}
-.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}
-.grid-3-1{display:grid;grid-template-columns:2fr 1fr;gap:16px;margin-bottom:16px}
-.grid-full{margin-bottom:16px}
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:32px}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:24px}
 .card-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:24px}
 .card-title{font-family:'Syne',sans-serif;font-size:0.82rem;font-weight:700;letter-spacing:0.06em;text-transform:uppercase}
 .card-badge{font-size:0.62rem;letter-spacing:0.1em;text-transform:uppercase;color:var(--muted);background:var(--surface2);padding:3px 8px;border-radius:3px;border:1px solid var(--border)}
-.chart-wrap{position:relative;height:220px}
-.chart-wrap-tall{position:relative;height:260px}
-.invoice-scroll{max-height:420px;overflow-y:auto;padding-right:4px}
-.invoice-scroll::-webkit-scrollbar{width:3px}
-.invoice-scroll::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
+.doc-scroll{max-height:460px;overflow-y:auto;padding-right:4px}
+.doc-scroll::-webkit-scrollbar{width:3px}
+.doc-scroll::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
 .month-group{margin-bottom:20px}
 .month-header{display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border);margin-bottom:8px;cursor:pointer;user-select:none}
 .month-name{font-family:'Syne',sans-serif;font-size:0.8rem;font-weight:700;transition:color 0.2s}
@@ -1018,28 +1099,21 @@ header{display:flex;align-items:flex-end;justify-content:space-between;margin-bo
 .month-count{font-size:0.62rem;color:var(--muted)}
 .overdue-flag{font-size:0.58rem;padding:2px 6px;border-radius:3px;background:rgba(255,107,107,0.15);color:var(--red);text-transform:uppercase}
 .month-rows{display:none}.month-rows.open{display:block}
-.inv-row{display:grid;grid-template-columns:1fr 1.5fr 1fr auto;gap:8px;padding:7px 0;border-bottom:1px solid rgba(42,42,64,0.5);font-size:0.7rem;align-items:center}
-.inv-row:last-child{border-bottom:none}
-.inv-ref2{color:var(--accent);font-size:0.65rem}
-.inv-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.inv-amt{font-family:'Syne',sans-serif;font-weight:600;text-align:right}
-.inv-due{font-size:0.62rem;color:var(--muted);text-align:right}
-.inv-due.overdue{color:var(--red)}
+.doc-row{display:grid;grid-template-columns:1fr 1.5fr 1fr auto;gap:8px;padding:7px 0;border-bottom:1px solid rgba(42,42,64,0.5);font-size:0.7rem;align-items:center}
+.doc-row:last-child{border-bottom:none}
+.doc-ref{color:var(--accent);font-size:0.65rem}
+.doc-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.doc-amt{font-family:'Syne',sans-serif;font-weight:600;text-align:right}
+.doc-due{font-size:0.62rem;color:var(--muted);text-align:right}
+.doc-due.overdue{color:var(--red)}
 .chevron{font-size:0.7rem;color:var(--muted);transition:transform 0.2s;display:inline-block}
 .chevron.open{transform:rotate(90deg)}
-.burn-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:20px}
-.burn-stat{background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:14px}
-.burn-stat-label{font-size:0.6rem;letter-spacing:0.12em;text-transform:uppercase;color:var(--muted);margin-bottom:6px}
-.burn-stat-value{font-family:'Syne',sans-serif;font-size:1.1rem;font-weight:700}
-.burn-toggle{display:flex;gap:6px;margin-bottom:14px}
-.burn-btn{background:var(--surface2);border:1px solid var(--border);color:var(--muted);padding:5px 12px;border-radius:4px;cursor:pointer;font-family:'DM Mono',monospace;font-size:0.65rem;letter-spacing:0.08em;text-transform:uppercase;transition:all 0.2s}
-.burn-btn:hover{border-color:var(--accent2);color:var(--accent2)}
-.burn-btn.active{background:var(--accent2);border-color:var(--accent2);color:#0a0a0f}
+.bal-detail{font-size:0.6rem;color:var(--muted);margin-top:6px;line-height:1.6}
 .loading-text{font-size:0.68rem;color:var(--muted);letter-spacing:0.1em;text-transform:uppercase;animation:pulse 1.5s ease-in-out infinite}
 .error-text{font-size:0.68rem;color:var(--red)}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
 @keyframes fadeUp{to{opacity:1;transform:translateY(0)}}
-@media(max-width:900px){.kpi-row{grid-template-columns:repeat(2,1fr)}.grid-2,.grid-3-1{grid-template-columns:1fr}.burn-stats{grid-template-columns:1fr 1fr}}
+@media(max-width:900px){.kpi-row{grid-template-columns:repeat(2,1fr)}.grid-2{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -1048,76 +1122,157 @@ header{display:flex;align-items:flex-end;justify-content:space-between;margin-bo
     <div class="logo-area"><h1>Finance<span>.</span></h1><p>Live overview — powered by Xero</p></div>
     <div class="header-meta">
       <span>LAST UPDATED</span><span id="last-updated">—</span>
-      <div class="nav-links">
-        <a href="/forecast" class="nav-link">Forecast</a>
-        <a href="/settings" class="nav-link">Settings</a>
-      </div>
+      <div class="nav-links"><a href="/forecast" class="nav-link">Forecast</a><a href="/settings" class="nav-link">Settings</a></div>
       <button class="refresh-btn" onclick="loadAll()">↻ Refresh</button>
     </div>
   </header>
+
   <div class="kpi-row">
-    <div class="kpi-card"><div class="kpi-label">Current Month Net</div><div class="kpi-value neutral" id="kpi-net">—</div><div class="kpi-sub" id="kpi-net-sub">Loading…</div></div>
-    <div class="kpi-card"><div class="kpi-label">Outstanding Invoices</div><div class="kpi-value neutral" id="kpi-inv-total">—</div><div class="kpi-sub" id="kpi-inv-count">Loading…</div></div>
-    <div class="kpi-card"><div class="kpi-label">Overdue Amount</div><div class="kpi-value neutral" id="kpi-overdue">—</div><div class="kpi-sub" id="kpi-overdue-count">Loading…</div></div>
-    <div class="kpi-card"><div class="kpi-label">Avg Monthly Burn</div><div class="kpi-value neutral" id="kpi-burn">—</div><div class="kpi-sub" id="kpi-burn-sub">Loading…</div></div>
-  </div>
-  <div class="section-label">Cash Flow</div>
-  <div class="grid-3-1" style="margin-bottom:32px">
-    <div class="card"><div class="card-header"><span class="card-title">Monthly In / Out</span><span class="card-badge">Last 12 months</span></div><div class="chart-wrap"><canvas id="cashflowChart"></canvas><div id="cashflow-loading" class="loading-text">Fetching transactions…</div></div></div>
-    <div class="card"><div class="card-header"><span class="card-title">In vs Out</span><span class="card-badge" id="donut-label">This month</span></div><div class="chart-wrap"><canvas id="donutChart"></canvas><div id="donut-loading" class="loading-text">Fetching…</div></div></div>
-  </div>
-  <div class="section-label">Cash Burn</div>
-  <div class="grid-full" style="margin-bottom:32px">
-    <div class="card">
-      <div class="card-header"><span class="card-title">Spend & Running Balance</span><span class="card-badge" id="burn-badge">Last 24 months</span></div>
-      <div class="burn-toggle">
-        <button class="burn-btn" id="burn-btn-12" onclick="setBurnWindow(12)">12 months</button>
-        <button class="burn-btn active" id="burn-btn-24" onclick="setBurnWindow(24)">24 months</button>
-        <button class="burn-btn" id="burn-btn-all" onclick="setBurnWindow(0)">All time</button>
-      </div>
-      <div class="burn-stats">
-        <div class="burn-stat"><div class="burn-stat-label">This month spend</div><div class="burn-stat-value negative" id="burn-this-month">—</div></div>
-        <div class="burn-stat"><div class="burn-stat-label">Avg monthly spend</div><div class="burn-stat-value neutral" id="burn-avg">—</div></div>
-        <div class="burn-stat"><div class="burn-stat-label">Actual bank balance</div><div class="burn-stat-value neutral" id="burn-balance">—</div><div style="font-size:0.6rem;color:var(--muted);margin-top:3px" id="burn-balance-src"></div></div>
-      </div>
-      <div class="chart-wrap-tall"><canvas id="burnChart"></canvas><div id="burn-loading" class="loading-text">Fetching spend data…</div></div>
+    <div class="kpi-card">
+      <div class="kpi-label">Bank Balance</div>
+      <div class="kpi-value neutral" id="kpi-balance">—</div>
+      <div class="kpi-sub" id="kpi-balance-sub">Loading…</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Outstanding Invoices</div>
+      <div class="kpi-value neutral" id="kpi-inv-total">—</div>
+      <div class="kpi-sub" id="kpi-inv-count">Loading…</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Overdue Invoices</div>
+      <div class="kpi-value neutral" id="kpi-overdue">—</div>
+      <div class="kpi-sub" id="kpi-overdue-count">Loading…</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Outstanding Bills</div>
+      <div class="kpi-value neutral" id="kpi-bills-total">—</div>
+      <div class="kpi-sub" id="kpi-bills-count">Loading…</div>
     </div>
   </div>
-  <div class="section-label">Receivables & Profitability</div>
-  <div class="grid-2" style="margin-bottom:32px">
+
+  <div class="section-label">Receivables — Unpaid Invoices</div>
+  <div class="grid-2">
     <div class="card">
-      <div class="card-header"><span class="card-title">Unpaid Invoices by Due Month</span><span class="card-badge" id="inv-month-badge">—</span></div>
-      <div class="chart-wrap" style="margin-bottom:20px"><canvas id="invMonthChart"></canvas><div id="inv-month-loading" class="loading-text">Fetching invoices…</div></div>
-      <div class="invoice-scroll" id="inv-month-list"><div class="loading-text">Loading detail…</div></div>
+      <div class="card-header"><span class="card-title">By Due Month</span><span class="card-badge" id="inv-month-badge">—</span></div>
+      <div class="doc-scroll" id="inv-month-list"><div class="loading-text">Loading invoices…</div></div>
     </div>
     <div class="card">
-      <div class="card-header"><span class="card-title">Profit & Loss</span><span class="card-badge">YTD monthly</span></div>
-      <div class="chart-wrap-tall"><canvas id="pnlChart"></canvas><div id="pnl-loading" class="loading-text">Fetching data…</div></div>
-      <div style="margin-top:16px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px" id="pnl-summary"></div>
+      <div class="card-header"><span class="card-title">Outstanding Bills</span><span class="card-badge" id="bills-month-badge">—</span></div>
+      <div class="doc-scroll" id="bills-month-list"><div class="loading-text">Loading bills…</div></div>
     </div>
   </div>
+
 </div>
 <script>
 const fmt=n=>new Intl.NumberFormat('en-GB',{style:'currency',currency:'GBP',maximumFractionDigits:0}).format(n);
 const fmtDec=n=>new Intl.NumberFormat('en-GB',{style:'currency',currency:'GBP',minimumFractionDigits:2}).format(n);
 const fmtMo=s=>{try{const[y,m]=s.split('-');return new Date(y,m-1,1).toLocaleDateString('en-GB',{month:'short',year:'2-digit'});}catch(e){return s;}};
-Chart.defaults.color='#6b6b8a';Chart.defaults.borderColor='#2a2a40';Chart.defaults.font.family="'DM Mono',monospace";Chart.defaults.font.size=11;
-let cashflowChart,donutChart,burnChart,invMonthChart,pnlChart;
-async function loadCashflow(){try{const res=await fetch('/api/cashflow');if(!res.ok)throw new Error(await res.text());const data=await res.json();document.getElementById('cashflow-loading')?.remove();document.getElementById('donut-loading')?.remove();const labels=Object.keys(data).slice(-12);const inflow=labels.map(m=>data[m].inflow),outflow=labels.map(m=>data[m].outflow),net=labels.map(m=>data[m].net);const latest=data[labels[labels.length-1]];if(latest){const el=document.getElementById('kpi-net');el.textContent=fmt(latest.net);el.className='kpi-value '+(latest.net>=0?'positive':'negative');document.getElementById('kpi-net-sub').textContent='In '+fmt(latest.inflow)+' / Out '+fmt(latest.outflow);document.getElementById('donut-label').textContent=fmtMo(labels[labels.length-1]);}if(cashflowChart)cashflowChart.destroy();cashflowChart=new Chart(document.getElementById('cashflowChart').getContext('2d'),{type:'bar',data:{labels:labels.map(fmtMo),datasets:[{label:'Inflow',data:inflow,backgroundColor:'rgba(78,205,196,0.7)',borderRadius:3,borderSkipped:false},{label:'Outflow',data:outflow,backgroundColor:'rgba(255,107,107,0.7)',borderRadius:3,borderSkipped:false},{label:'Net',data:net,type:'line',borderColor:'#7c6af7',backgroundColor:'rgba(124,106,247,0.08)',borderWidth:2,pointRadius:3,fill:true,tension:0.3,yAxisID:'y'}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index'},plugins:{legend:{display:true,position:'bottom',labels:{boxWidth:10,padding:14}}},scales:{x:{grid:{color:'#2a2a40'}},y:{grid:{color:'#2a2a40'},ticks:{callback:v=>fmt(v)}}}}});if(donutChart)donutChart.destroy();donutChart=new Chart(document.getElementById('donutChart').getContext('2d'),{type:'doughnut',data:{labels:['Inflow','Outflow'],datasets:[{data:[latest?.inflow||0,latest?.outflow||0],backgroundColor:['rgba(78,205,196,0.85)','rgba(255,107,107,0.85)'],borderColor:'#12121a',borderWidth:3,hoverOffset:8}]},options:{responsive:true,maintainAspectRatio:false,cutout:'68%',plugins:{legend:{position:'bottom',labels:{boxWidth:10,padding:14}},tooltip:{callbacks:{label:ctx=>' '+fmt(ctx.raw)}}}}});}catch(e){const el=document.getElementById('cashflow-loading');if(el){el.textContent='Error: '+e.message;el.className='error-text';}}}
-let burnAllData=null;let burnWindow=24;
-function renderBurnChart(data,months){if(burnChart)burnChart.destroy();const spend=months.map(m=>data[m].spend),balance=months.map(m=>data[m].runningBalance);const last6=spend.slice(-6),avg=last6.reduce((a,b)=>a+b,0)/(last6.length||1);const latest=data[months[months.length-1]];document.getElementById('burn-this-month').textContent=fmt(latest?.spend||0);document.getElementById('burn-avg').textContent=fmt(avg);document.getElementById('kpi-burn').textContent=fmt(avg);document.getElementById('kpi-burn').className='kpi-value negative';document.getElementById('kpi-burn-sub').textContent='6-month average';burnChart=new Chart(document.getElementById('burnChart').getContext('2d'),{type:'bar',data:{labels:months.map(fmtMo),datasets:[{label:'Monthly Spend',data:spend,backgroundColor:'rgba(255,107,107,0.6)',borderRadius:3,borderSkipped:false,yAxisID:'y'},{label:'Running Balance',data:balance,type:'line',borderColor:'#ffd93d',backgroundColor:'rgba(255,217,61,0.06)',borderWidth:2,pointRadius:2,fill:true,tension:0.3,yAxisID:'y1'}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index'},plugins:{legend:{display:true,position:'bottom',labels:{boxWidth:10,padding:14}}},scales:{x:{grid:{color:'#2a2a40'}},y:{grid:{color:'#2a2a40'},ticks:{callback:v=>fmt(v)},title:{display:true,text:'Spend',color:'#6b6b8a',font:{size:10}}},y1:{position:'right',grid:{display:false},ticks:{callback:v=>fmt(v)},title:{display:true,text:'Balance',color:'#6b6b8a',font:{size:10}}}}}})}
-async function loadBankBalance(){try{const res=await fetch('/api/bankbalance');if(!res.ok)throw new Error(await res.text());const data=await res.json();const balEl=document.getElementById('burn-balance');balEl.textContent=fmt(data.total);balEl.className='burn-stat-value '+(data.total>=0?'positive':'negative');const srcEl=document.getElementById('burn-balance-src');if(srcEl&&data.accounts&&data.accounts.length){srcEl.textContent=data.accounts.map(a=>a.name+': '+fmt(a.balance)).join(' • ');}}catch(e){const el=document.getElementById('burn-balance');if(el){el.textContent='Error';el.className='burn-stat-value negative';}const srcEl=document.getElementById('burn-balance-src');if(srcEl)srcEl.textContent=e.message;}}
-function setBurnWindow(n){burnWindow=n;['12','24','all'].forEach(k=>{const btn=document.getElementById('burn-btn-'+k);if(btn)btn.className='burn-btn'+((k==='all'&&n===0)||(k==='12'&&n===12)||(k==='24'&&n===24)?' active':'');});const labels={0:'All time',12:'Last 12 months',24:'Last 24 months'};document.getElementById('burn-badge').textContent=labels[n]||'Last '+n+' months';if(!burnAllData)return;const allMonths=Object.keys(burnAllData);const months=n===0?allMonths:allMonths.slice(-n);renderBurnChart(burnAllData,months);}
-async function loadCashBurn(){try{const res=await fetch('/api/cashburn');if(!res.ok)throw new Error(await res.text());const data=await res.json();document.getElementById('burn-loading')?.remove();burnAllData=data;const allMonths=Object.keys(data);const months=burnWindow===0?allMonths:allMonths.slice(-burnWindow);renderBurnChart(data,months);}catch(e){const el=document.getElementById('burn-loading');if(el){el.textContent='Error: '+e.message;el.className='error-text';}}}
-async function loadInvoicesByMonth(){try{const res=await fetch('/api/invoices-by-month');if(!res.ok)throw new Error(await res.text());const data=await res.json();document.getElementById('inv-month-loading')?.remove();const months=Object.keys(data),totals=months.map(m=>data[m].total),overdueTot=months.map(m=>data[m].overdue);const totalAll=totals.reduce((a,b)=>a+b,0),totalOv=overdueTot.reduce((a,b)=>a+b,0);const countAll=months.reduce((a,m)=>a+data[m].count,0),countOv=months.reduce((a,m)=>a+data[m].invoices.filter(i=>i.overdue).length,0);document.getElementById('kpi-inv-total').textContent=fmt(totalAll);document.getElementById('kpi-inv-total').className='kpi-value neutral';document.getElementById('kpi-inv-count').textContent=countAll+' invoices outstanding';const ovEl=document.getElementById('kpi-overdue');ovEl.textContent=fmt(totalOv);ovEl.className='kpi-value '+(totalOv>0?'negative':'positive');document.getElementById('kpi-overdue-count').textContent=countOv+' invoice'+(countOv!==1?'s':'')+' overdue';document.getElementById('inv-month-badge').textContent=months.length+' months';if(invMonthChart)invMonthChart.destroy();invMonthChart=new Chart(document.getElementById('invMonthChart').getContext('2d'),{type:'bar',data:{labels:months.map(fmtMo),datasets:[{label:'Overdue',data:overdueTot,backgroundColor:'rgba(255,107,107,0.75)',borderRadius:3,borderSkipped:false},{label:'On track',data:totals.map((t,i)=>t-overdueTot[i]),backgroundColor:'rgba(78,205,196,0.6)',borderRadius:3,borderSkipped:false}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index'},plugins:{legend:{display:true,position:'bottom',labels:{boxWidth:10,padding:14}},tooltip:{callbacks:{footer:items=>'Total: '+fmt(items.reduce((a,i)=>a+i.raw,0))}}},scales:{x:{stacked:true,grid:{color:'#2a2a40'}},y:{stacked:true,grid:{color:'#2a2a40'},ticks:{callback:v=>fmt(v)}}}}});const listHtml=months.map((month,idx)=>{const d=data[month],hasOv=d.overdue>0;const rows=d.invoices.map(inv=>'<div class="inv-row"><span class="inv-ref2">'+inv.ref+'</span><span class="inv-name">'+inv.contact+'</span><span class="inv-amt">'+fmtDec(inv.amount)+'</span><span class="inv-due'+(inv.overdue?' overdue':'')+'">'+inv.due+'</span></div>').join('');const open=idx===0?' open':'';return'<div class="month-group"><div class="month-header" onclick="toggleMonth(this)"><div style="display:flex;align-items:center;gap:10px"><span class="chevron'+(idx===0?' open':'')+'">&#9654;</span><span class="month-name">'+fmtMo(month)+'</span></div><div class="month-meta">'+(hasOv?'<span class="overdue-flag">'+fmt(d.overdue)+' overdue</span>':'')+'<span class="month-count">'+d.count+' inv</span><span class="month-total">'+fmt(d.total)+'</span></div></div><div class="month-rows'+open+'">'+rows+'</div></div>';}).join('');document.getElementById('inv-month-list').innerHTML=listHtml||'<div style="color:var(--muted);font-size:0.7rem">No outstanding invoices</div>';}catch(e){const el=document.getElementById('inv-month-loading');if(el){el.textContent='Error: '+e.message;el.className='error-text';}document.getElementById('inv-month-list').innerHTML='<div class="error-text">'+e.message+'</div>';}}
+
+function buildMonthList(byMonth, redFlag, containerEl, badgeEl){
+  const months=Object.keys(byMonth).sort();
+  if(badgeEl) badgeEl.textContent=months.length+' months';
+  const now=new Date(); now.setHours(0,0,0,0);
+  const html=months.map((month,idx)=>{
+    const d=byMonth[month];
+    const hasFlag=d[redFlag]>0;
+    const rows=d.items.map(it=>'<div class="doc-row"><span class="doc-ref">'+it.ref+'</span><span class="doc-name">'+it.contact+'</span><span class="doc-amt">'+fmtDec(it.amount)+'</span><span class="doc-due'+(it.overdue?' overdue':'')+'">'+it.due+'</span></div>').join('');
+    const open=idx===0?' open':'';
+    return '<div class="month-group"><div class="month-header" onclick="toggleMonth(this)"><div style="display:flex;align-items:center;gap:10px"><span class="chevron'+(idx===0?' open':'')+'">&#9654;</span><span class="month-name">'+fmtMo(month)+'</span></div><div class="month-meta">'+(hasFlag?'<span class="overdue-flag">'+fmt(d[redFlag])+' overdue</span>':'')+'<span class="month-count">'+d.items.length+' items</span><span class="month-total">'+fmt(d.total)+'</span></div></div><div class="month-rows'+open+'">'+rows+'</div></div>';
+  }).join('');
+  containerEl.innerHTML=html||'<div style="color:var(--muted);font-size:0.7rem">Nothing outstanding</div>';
+}
+
 function toggleMonth(h){const r=h.nextElementSibling,c=h.querySelector('.chevron'),o=r.classList.toggle('open');c.classList.toggle('open',o);}
-async function loadPnL(){try{const res=await fetch('/api/pnl');if(!res.ok)throw new Error(await res.text());const data=await res.json();document.getElementById('pnl-loading')?.remove();const months=Object.keys(data),income=months.map(m=>data[m].income),expenses=months.map(m=>data[m].expenses),profit=months.map(m=>data[m].profit);const ytdI=income.reduce((a,b)=>a+b,0),ytdE=expenses.reduce((a,b)=>a+b,0),ytdP=ytdI-ytdE;document.getElementById('pnl-summary').innerHTML='<div class="burn-stat"><div class="burn-stat-label">YTD Revenue</div><div class="burn-stat-value positive">'+fmt(ytdI)+'</div></div><div class="burn-stat"><div class="burn-stat-label">YTD Costs</div><div class="burn-stat-value negative">'+fmt(ytdE)+'</div></div><div class="burn-stat"><div class="burn-stat-label">YTD Profit</div><div class="burn-stat-value '+(ytdP>=0?'positive':'negative')+'">'+fmt(ytdP)+'</div></div>';if(pnlChart)pnlChart.destroy();pnlChart=new Chart(document.getElementById('pnlChart').getContext('2d'),{type:'line',data:{labels:months.map(fmtMo),datasets:[{label:'Income',data:income,borderColor:'rgba(78,205,196,0.9)',backgroundColor:'rgba(78,205,196,0.07)',borderWidth:2,pointRadius:3,fill:true,tension:0.3},{label:'Expenses',data:expenses,borderColor:'rgba(255,107,107,0.9)',backgroundColor:'rgba(255,107,107,0.07)',borderWidth:2,pointRadius:3,fill:true,tension:0.3},{label:'Net Profit',data:profit,borderColor:'#7c6af7',backgroundColor:'transparent',borderWidth:2,pointRadius:3,borderDash:[4,4],tension:0.3}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index'},plugins:{legend:{display:true,position:'bottom',labels:{boxWidth:10,padding:14}}},scales:{x:{grid:{color:'#2a2a40'}},y:{grid:{color:'#2a2a40'},ticks:{callback:v=>fmt(v)}}}}});}catch(e){const el=document.getElementById('pnl-loading');if(el){el.textContent='Error: '+e.message;el.className='error-text';}}}
-async function loadAll(){document.getElementById('last-updated').textContent='Loading…';await Promise.all([loadCashflow(),loadCashBurn(),loadBankBalance(),loadInvoicesByMonth(),loadPnL()]);document.getElementById('last-updated').textContent=new Date().toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',second:'2-digit'});}
+
+async function loadBankBalance(){
+  try{
+    const res=await fetch('/api/bankbalance');
+    if(!res.ok)throw new Error(await res.text());
+    const data=await res.json();
+    const el=document.getElementById('kpi-balance');
+    const sub=document.getElementById('kpi-balance-sub');
+    if(data.total===null){
+      el.textContent='Unavailable';
+      el.className='kpi-value neutral';
+      if(sub)sub.textContent=data.note||'Could not retrieve from Xero';
+      return;
+    }
+    el.textContent=fmt(data.total);
+    el.className='kpi-value '+(data.total>=0?'positive':'negative');
+    if(data.accounts&&data.accounts.length){
+      sub.innerHTML=data.accounts.map(a=>'<span>'+a.name+': '+fmt(a.balance||0)+'</span>').join('<br>');
+    }
+  }catch(e){
+    document.getElementById('kpi-balance').textContent='Error';
+    document.getElementById('kpi-balance-sub').textContent=e.message;
+  }
+}
+
+async function loadInvoices(){
+  try{
+    const res=await fetch('/api/invoices-by-month');
+    if(!res.ok)throw new Error(await res.text());
+    const raw=await res.json();
+    const now=new Date(); now.setHours(0,0,0,0);
+    // Reshape to common format
+    const byMonth={};
+    for(const[month,d] of Object.entries(raw)){
+      byMonth[month]={total:d.total,overdue:d.overdue,items:d.invoices.map(i=>({ref:i.ref,contact:i.contact,amount:i.amount,due:i.due,overdue:i.overdue}))};
+    }
+    const totalAll=Object.values(byMonth).reduce((a,d)=>a+d.total,0);
+    const totalOv=Object.values(byMonth).reduce((a,d)=>a+d.overdue,0);
+    const countAll=Object.values(byMonth).reduce((a,d)=>a+d.items.length,0);
+    const countOv=Object.values(byMonth).reduce((a,d)=>a+d.items.filter(i=>i.overdue).length,0);
+    const el=document.getElementById('kpi-inv-total'); el.textContent=fmt(totalAll); el.className='kpi-value neutral';
+    document.getElementById('kpi-inv-count').textContent=countAll+' invoices outstanding';
+    const ovEl=document.getElementById('kpi-overdue'); ovEl.textContent=fmt(totalOv); ovEl.className='kpi-value '+(totalOv>0?'negative':'positive');
+    document.getElementById('kpi-overdue-count').textContent=countOv+' invoice'+(countOv!==1?'s':'')+' overdue';
+    buildMonthList(byMonth,'overdue',document.getElementById('inv-month-list'),document.getElementById('inv-month-badge'));
+  }catch(e){
+    document.getElementById('inv-month-list').innerHTML='<div class="error-text">'+e.message+'</div>';
+  }
+}
+
+async function loadBills(){
+  try{
+    const r2=await fetch('/api/bills');
+    if(!r2.ok)throw new Error(await r2.text());
+    const raw=await r2.json();
+    const now=new Date(); now.setHours(0,0,0,0);
+    const byMonth={};
+    for(const bill of raw.Invoices||[]){
+      const due=bill.DueDate; if(!due)continue;
+      let d;
+      const ms=due.match(/\/Date\((\d+)/);
+      if(ms){d=new Date(parseInt(ms[1]));}else{d=new Date(due);}
+      if(isNaN(d.getTime()))continue;
+      const month=d.toISOString().substring(0,7);
+      const amount=bill.AmountDue||0;
+      const isOver=d<now;
+      if(!byMonth[month])byMonth[month]={total:0,overdue:0,items:[]};
+      byMonth[month].total+=amount;
+      if(isOver)byMonth[month].overdue+=amount;
+      byMonth[month].items.push({ref:bill.InvoiceNumber||bill.Reference||'—',contact:bill.Contact?.Name||'—',amount,due:d.toISOString().substring(0,10),overdue:isOver});
+    }
+    const totalAll=Object.values(byMonth).reduce((a,d)=>a+d.total,0);
+    const countAll=Object.values(byMonth).reduce((a,d)=>a+d.items.length,0);
+    const el=document.getElementById('kpi-bills-total'); el.textContent=fmt(totalAll); el.className='kpi-value '+(totalAll>0?'negative':'neutral');
+    document.getElementById('kpi-bills-count').textContent=countAll+' bill'+(countAll!==1?'s':'')+' outstanding';
+    buildMonthList(byMonth,'overdue',document.getElementById('bills-month-list'),document.getElementById('bills-month-badge'));
+  }catch(e){
+    document.getElementById('bills-month-list').innerHTML='<div class="error-text">'+e.message+'</div>';
+  }
+}
+
+async function loadAll(){
+  document.getElementById('last-updated').textContent='Loading…';
+  await Promise.all([loadBankBalance(),loadInvoices(),loadBills()]);
+  document.getElementById('last-updated').textContent=new Date().toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+}
 loadAll();
 </script>
 </body></html>
 `;
-
 // ─── Forecast HTML ─────────────────────────────────────────────────────────────
 const FORECAST_HTML = `<!DOCTYPE html>
 <html lang="en">
