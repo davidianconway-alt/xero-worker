@@ -22,7 +22,7 @@ interface CostSettings {
   hotelNightlyCost: number;
   subsistenceDailyRate: number;
   drivingSpeedMph: number;
-  setupHours: Record<string, number>;   // keyed by resource type prefix, e.g. "Day Van" → 1
+  setupHours: Record<string, number>;
   contingencyHours: number;
   payeMode: boolean;
   payeOnCostMultiplier: number;
@@ -47,7 +47,7 @@ interface EventCosts {
 
 interface PipelineItem {
   id: string;
-  bookingId: string;          // original SP booking ID (shared across multi-unit rows)
+  bookingId: string;
   name: string;
   status: string;
   isPast: boolean;
@@ -62,7 +62,7 @@ interface PipelineItem {
   unitCount: number;
   resourceTypes: string[];
   address: string | null;
-  operationalHours: number | null;  // total (per-day x days)
+  operationalHours: number | null;
   opHoursPerDay: number | null;
   opHoursSource: string;
   costs: EventCosts;
@@ -79,7 +79,7 @@ const DEFAULT_COST_SETTINGS: CostSettings = {
   setupHours:            { "Day Van": 1, "Trailer": 4, "POD": 4 },
   contingencyHours:      1,
   payeMode:              false,
-  payeOnCostMultiplier:  1.258,   // employer NI 13.8% + holiday pay 12.07%
+  payeOnCostMultiplier:  1.258,
 };
 
 const XERO_AUTH_URL  = "https://login.xero.com/identity/connect/authorize";
@@ -104,7 +104,6 @@ async function geocodePostcode(postcode: string): Promise<{ lat: number; lng: nu
         return result;
       }
     }
-    // Fall back to outcode endpoint for partial postcodes
     const outcodeRes = await fetch(`https://api.postcodes.io/outcodes/${encodeURIComponent(key)}`);
     if (outcodeRes.ok) {
       const outcodeData: any = await outcodeRes.json();
@@ -122,13 +121,11 @@ async function geocodePostcode(postcode: string): Promise<{ lat: number; lng: nu
   }
 }
 
-// Bulk geocode up to 100 postcodes in one request — avoids rate limiting
 async function bulkGeocodePostcodes(postcodes: string[]): Promise<void> {
   const unique = [...new Set(postcodes.map(p => p.trim().toUpperCase().replace(/\s+/g, "")))];
   const toFetch = unique.filter(p => p && !geocodeCache.has(p));
   if (toFetch.length === 0) return;
 
-  // Process in batches of 100 (postcodes.io bulk limit)
   for (let i = 0; i < toFetch.length; i += 100) {
     const batch = toFetch.slice(i, i + 100);
     try {
@@ -161,66 +158,47 @@ function haversineKm(a: { lat: number; lng: number }, b: { lat: number; lng: num
 
 function kmToMiles(km: number): number { return km * 0.621371; }
 
-// Extract the first UK-looking postcode from a freetext address
 function extractPostcode(address: string): string | null {
   if (!address) return null;
-
-  // Strip what3words patterns first (///word.word.word or w3w links)
   const cleaned = address
     .replace(/\/\/\/[\w]+\.[\w]+\.[\w]+/g, "")
     .replace(/https?:\/\/(www\.)?(what3words\.com|w3w\.co)\/[\w.]+/gi, "")
     .replace(/what3words:?\s*[\w./]*/gi, "")
     .replace(/w3w:?\s*[\w./]*/gi, "")
     .trim();
-
-  // Full UK postcode: e.g. GL10 3RF, SW1A 1AA, B40 1PP, WC2E 7BB
   const fullMatch = cleaned.match(/\b([A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2})\b/i);
   if (fullMatch) return fullMatch[1].replace(/\s+/g, " ").trim();
-
-  // Outward code only: e.g. GL10, SW1A, B40 — try to geocode the district
   const outwardMatch = cleaned.match(/\b([A-Z]{1,2}\d{1,2}[A-Z]?)\b/i);
   if (outwardMatch) return outwardMatch[1].trim();
-
   return null;
 }
 
-// Driving hours: fix divide by zero if drivingSpeedMph is 0 or missing
 function calcDrivingHours(miles: number, speedMph: number): number {
   if (miles <= 0) return 0;
-  const speed = speedMph && speedMph > 0 ? speedMph : 40; // safe fallback
+  const speed = speedMph && speedMph > 0 ? speedMph : 40;
   return (miles * 2) / speed;
 }
 
-// Parse "10 hours", "10h", "10:00", "8-10" → decimal hours
 function parseOperationalHours(raw: string | null): number | null {
   if (!raw) return null;
   const cleaned = raw.trim().toLowerCase();
-  // Range like "8-10" → take the upper end
   const rangeMatch = cleaned.match(/^(\d+(?:\.\d+)?)\s*[-–to]+\s*(\d+(?:\.\d+)?)/);
   if (rangeMatch) return parseFloat(rangeMatch[2]);
-  // HH:MM
   const timeMatch = cleaned.match(/^(\d+):(\d{2})/);
   if (timeMatch) return parseInt(timeMatch[1]) + parseInt(timeMatch[2]) / 60;
-  // Plain number with optional unit
   const numMatch = cleaned.match(/^(\d+(?:\.\d+)?)/);
   if (numMatch) return parseFloat(numMatch[1]);
   return null;
 }
 
-// "Van (Adam), DayVan (Holly)" → 2; also handles plain number strings
 function countUnitsFromEquipment(raw: string | null, fallbackUnitCount: number): number {
   if (!raw) return fallbackUnitCount;
   const trimmed = raw.trim();
-  // Plain integer string like "2"
   if (/^\d+$/.test(trimmed)) return parseInt(trimmed);
-  // Count comma/semicolon-separated items
   const parts = trimmed.split(/[,;]+/).filter(s => s.trim().length > 0);
   return parts.length > 0 ? parts.length : fallbackUnitCount;
 }
 
-// Resolve setup hours for a list of resource names using the setupHours map.
-// Matches by prefix, case-insensitive. Sums across all units.
-// e.g. ["Day Van (Adam)", "Trailer (Holly)"] → 1 + 4 = 5h
 function resolveSetupHours(resourceNames: string[], setupMap: Record<string, number>, contingency: number): number {
   let total = 0;
   for (const name of resourceNames) {
@@ -233,9 +211,9 @@ function resolveSetupHours(resourceNames: string[], setupMap: Record<string, num
         break;
       }
     }
-    if (!matched) total += 1; // safe fallback for unrecognised resource type
+    if (!matched) total += 1;
   }
-  return total + contingency; // contingency applied once per event
+  return total + contingency;
 }
 
 async function estimateEventCosts(
@@ -246,10 +224,7 @@ async function estimateEventCosts(
   eventDays: number,
   settings: CostSettings
 ): Promise<EventCosts> {
-  // 1 staff per unit (self-employed drivers paid for working hours only)
   const staffCount = unitCount;
-
-  // Mileage distance (one-way)
   let miles = 0;
   if (address) {
     const pc = extractPostcode(address);
@@ -264,33 +239,19 @@ async function estimateEventCosts(
     }
   }
 
-  // Driving hours: return trip at configured speed, per unit (each drives separately)
   const drivingHoursPerUnit = calcDrivingHours(miles, settings.drivingSpeedMph);
   const totalDrivingHours   = drivingHoursPerUnit * unitCount;
-
-  // Setup/breakdown hours from resource types + contingency
   const setupHrs = resolveSetupHours(resourceNames, settings.setupHours, settings.contingencyHours);
-
-  // Operational hours: use field value if available, otherwise fallback per day
   const opHours     = operationalHours ?? (eventDays >= 3 ? 10 : 8) * eventDays;
   const totalPaidHours = opHours + totalDrivingHours + setupHrs;
-
-  // Wages — PAYE multiplier applied globally if payeMode is on
   const wageMultiplier = settings.payeMode ? settings.payeOnCostMultiplier : 1;
   const wages = staffCount * totalPaidHours * settings.hourlyRate * wageMultiplier;
-
-  // Mileage cost: return trip × units
   const mileage = miles * 2 * unitCount * settings.mileageRatePerMile;
-
-  // Hotel: multi-day events, or if distance > threshold
   const needsHotel = eventDays > 1 || miles > settings.hotelThresholdMiles;
   const nights     = needsHotel ? Math.max(eventDays - 1, 1) : 0;
   const hotel      = nights * staffCount * settings.hotelNightlyCost;
-
-  // Subsistence
   const subsistenceDays = eventDays + (miles > settings.hotelThresholdMiles ? 1 : 0);
   const subsistence     = subsistenceDays * staffCount * settings.subsistenceDailyRate;
-
   const total = wages + mileage + hotel + subsistence;
 
   const payeNote = settings.payeMode ? ` ×${settings.payeOnCostMultiplier} PAYE` : "";
@@ -344,7 +305,6 @@ async function handleSettingsPost(request: Request, env: Env): Promise<Response>
     const current = await getCostSettings(env);
     const updated: CostSettings = { ...current, ...body };
     await env.XERO_KV.put("cost_settings", JSON.stringify(updated));
-    // Clear geocode cache when base postcode changes
     geocodeCache.clear();
     return Response.json({ ok: true, settings: updated }, { headers: { "Access-Control-Allow-Origin": "*" } });
   } catch (e: any) {
@@ -365,6 +325,14 @@ function parseXeroDateObj(val: string | undefined | null): Date | null {
   const match = val.match(/\/Date\((\d+)/);
   if (match) return new Date(parseInt(match[1]));
   return new Date(val);
+}
+
+// Full ISO date (YYYY-MM-DD) from either /Date(ms)/ or ISO string
+function parseXeroDateFull(val: string | undefined | null): string {
+  if (!val) return "";
+  const ms = val.match(/\/Date\((\d+)/);
+  if (ms) return new Date(parseInt(ms[1])).toISOString().substring(0, 10);
+  return val.substring(0, 10);
 }
 
 function startOfThisWeek(): Date {
@@ -408,7 +376,7 @@ async function fetchSonderplanPipeline(
   fromTime: number,
   toTime: number,
   costSettings: CostSettings,
-  requirePrice: boolean = true   // set false for all-events endpoint
+  requirePrice: boolean = true
 ): Promise<PipelineItem[]> {
   const PIPELINE_STATUSES = new Set(["Confirmed", "Provisional", "PAID", "Info Complete & Invoiced"]);
   const EXCLUDED_STATUSES = new Set(["Cancelled", "Passed on", "Unavailable", "Waiting List", "Set up/ Pack down/Travel"]);
@@ -419,10 +387,7 @@ async function fetchSonderplanPipeline(
     "Content-Type": "application/json",
   };
 
-  // Use the passed fromTime directly — callers are responsible for setting the right start date
-  // For forecast: starts today. For all-events: starts Jan 1.
   const effectiveFrom = fromTime;
-
   let allRows: any[] = [];
   let page = 1;
   let totalPages = 1;
@@ -441,7 +406,6 @@ async function fetchSonderplanPipeline(
   const seen = new Set<string>();
   const pipeline: PipelineItem[] = [];
 
-  // Helper: case-insensitive custom field lookup with fallback names
   const getField = (customFields: any[], ...names: string[]): string | null => {
     for (const name of names) {
       const f = customFields.find((cf: any) => cf.name?.toLowerCase() === name.toLowerCase());
@@ -450,7 +414,6 @@ async function fetchSonderplanPipeline(
     return null;
   };
 
-  // Pre-warm geocode cache in one bulk request to avoid postcodes.io rate limiting
   const allPostcodes: string[] = [costSettings.basePostcode];
   for (const row of allRows) {
     if (row.deleted) continue;
@@ -466,7 +429,6 @@ async function fetchSonderplanPipeline(
     if (row.deleted) continue;
 
     const statusRaw = row.status?.[0]?.name || "";
-    // Normalise — Sonderplan may return different casing or descriptions
     const status = statusRaw.trim();
     const statusLower = status.toLowerCase();
     const isPipelineStatus =
@@ -497,23 +459,18 @@ async function fetchSonderplanPipeline(
 
     const eventStart = row.start ? new Date(row.start * 1000) : null;
     if (!eventStart) continue;
-    // No date filter here — we include all Confirmed/Provisional from year start to forecast end
 
     const eventEnd  = row.end ? new Date(row.end * 1000) : eventStart;
     const rawDays   = Math.round((eventEnd.getTime() - eventStart.getTime()) / 86400000);
     const eventDays = Math.max(rawDays, 1);
 
-    // Custom fields — try multiple plausible names for each
     const addressRaw    = getField(cf, "Address", "Venue Address", "Event Address", "Location");
-    const equipmentRaw  = getField(cf, "Equipment", "Resources", "Units", "Vehicles");
     const opHoursRaw    = getField(cf, "Operational Hours", "Op Hours", "Hours", "Event Hours");
 
-    // Op hours from Sonderplan are per-day -- multiply by event days for total
     const opHoursPerDay         = parseOperationalHours(opHoursRaw);
     const operationalHoursTotal = opHoursPerDay !== null ? opHoursPerDay * eventDays : null;
     const opHoursSource         = opHoursPerDay !== null ? "Sonderplan" : "Fallback";
 
-    // Resource type names for setup hour lookup -- use Sonderplan resource names directly
     const resourceTypeNames: string[] = mobilooRes.map((r: any) => (r.name || "").trim()).filter(Boolean);
 
     const paymentDate = new Date(eventStart);
@@ -523,7 +480,6 @@ async function fetchSonderplanPipeline(
     const isPaid = statusLower === "paid" || statusLower === "invoiced";
 
     if (resourceTypeNames.length <= 1) {
-      // Single unit -- one row
       const costs = await estimateEventCosts(addressRaw, 1, resourceTypeNames, operationalHoursTotal, eventDays, costSettings);
       pipeline.push({
         id:               `${row.id}`,
@@ -546,7 +502,6 @@ async function fetchSonderplanPipeline(
         costs,
       });
     } else {
-      // Multiple units -- one row per resource, op hours shared equally, price split equally
       const sharedOpHours = operationalHoursTotal !== null
         ? operationalHoursTotal / resourceTypeNames.length
         : null;
@@ -554,7 +509,6 @@ async function fetchSonderplanPipeline(
 
       for (let i = 0; i < resourceTypeNames.length; i++) {
         const resourceName = resourceTypeNames[i];
-        // Price stays on first row only — booking-level figure, can't be split meaningfully per unit
         const unitPrice    = i === 0 ? parsed.price : null;
         const costs = await estimateEventCosts(addressRaw, 1, [resourceName], sharedOpHours, eventDays, costSettings);
         pipeline.push({
@@ -608,6 +562,7 @@ export default {
     if (path === "/api/events/all")        return handleAllEvents(env);
     if (path === "/api/pipeline")          return handlePipeline(env);
     if (path === "/api/sp-debug")          return handleSpDebug(env);
+    if (path === "/api/xero/invoices")     return handleXeroInvoices(env);
     if (path === "/api/settings") {
       if (method === "GET")  return handleSettingsGet(env);
       if (method === "POST") return handleSettingsPost(request, env);
@@ -739,7 +694,6 @@ async function handleSpDebug(env: Env): Promise<Response> {
   let parsed: any  = null;
   try { parsed = JSON.parse(rawText); } catch {}
 
-  // Collect every custom field name AND id seen on page 1
   const customFieldsSeen = new Map<string, number>();
   for (const row of (parsed?.data || [])) {
     for (const cf of (row.custom_fields || [])) {
@@ -756,7 +710,7 @@ async function handleSpDebug(env: Env): Promise<Response> {
     rawTextPreview: rawText.substring(0, 800),
     meta: parsed?.meta || null,
     total_rows_page1: parsed?.data?.length || 0,
-    custom_fields_seen: Object.fromEntries(customFieldsSeen), // { "Field Name": id }
+    custom_fields_seen: Object.fromEntries(customFieldsSeen),
     first_booking: parsed?.data?.[0] ? {
       id:            parsed.data[0].id,
       name:          parsed.data[0].name,
@@ -831,7 +785,6 @@ async function handleForecast(env: Env): Promise<Response> {
     return Math.floor((d.getTime() - weekStart.getTime()) / (86400000 * 7));
   }
 
-  // Xero confirmed inflows
   for (const inv of invData.Invoices || []) {
     const due = parseXeroDateObj(inv.DueDate); if (!due) continue;
     const wi  = getWeekIndex(due); if (wi < 0 || wi >= 34) continue;
@@ -840,9 +793,7 @@ async function handleForecast(env: Env): Promise<Response> {
     weeks[wi].totalIn += amount; weeks[wi].confirmedIn += amount;
   }
 
-  // Sonderplan pipeline inflows + event cost outflows
   for (const item of spPipeline as PipelineItem[]) {
-    // Inflow bucketed to payment date (1 month before event)
     const payDate = new Date(item.paymentDate);
     const wiPay   = getWeekIndex(payDate);
     if (wiPay >= 0 && wiPay < 34) {
@@ -855,7 +806,6 @@ async function handleForecast(env: Env): Promise<Response> {
       weeks[wiPay].pipelineIn += item.price;
     }
 
-    // Cost outflow bucketed to event start week
     if (item.costs.total > 0) {
       const wiEvent = getWeekIndex(new Date(item.eventStart));
       if (wiEvent >= 0 && wiEvent < 34) {
@@ -872,7 +822,6 @@ async function handleForecast(env: Env): Promise<Response> {
     }
   }
 
-  // Xero bills
   for (const bill of billData.Invoices || []) {
     const due = parseXeroDateObj(bill.DueDate); if (!due) continue;
     const wi  = getWeekIndex(due); if (wi < 0 || wi >= 34) continue;
@@ -882,7 +831,6 @@ async function handleForecast(env: Env): Promise<Response> {
     weeks[wi].totalOut += amount;
   }
 
-  // Recurring spend detection from bank transactions
   const txList        = (txData.BankTransactions||[]).filter((tx: any) => tx.Type==="SPEND"||tx.Type==="SPEND-OVERPAYMENT");
   const spendGroups: Record<string, { dates: Date[]; amount: number; name: string }> = {};
   const ninetyDaysAgo = addDays(new Date(), -90);
@@ -915,7 +863,6 @@ async function handleForecast(env: Env): Promise<Response> {
     }
   }
 
-  // Opening balance from historical transactions
   let openingBalance = 0;
   for (const tx of txData.BankTransactions||[]) {
     const d = parseXeroDateObj(tx.Date); if (!d || d >= weekStart) continue;
@@ -938,9 +885,6 @@ async function handleForecast(env: Env): Promise<Response> {
     .filter(p => { const wi = getWeekIndex(new Date(p.paymentDate)); return (wi<0 && new Date(p.paymentDate)>=today) || wi>=34; })
     .sort((a,b) => a.paymentDate.localeCompare(b.paymentDate));
 
-  // Past events: still Confirmed/Provisional after event date = potential uninvoiced work.
-  // NOT included in any cash flow figures. Flagged for manual review.
-  // When invoice reference link is built (item 5), this becomes an automatic reconciliation.
   const uninvoicedWarnings = pastItems
     .sort((a,b) => b.eventStart.localeCompare(a.eventStart))
     .map(p => ({
@@ -962,8 +906,6 @@ async function handleForecast(env: Env): Promise<Response> {
       beyondWindow,
       allItems:      futureItems,
     },
-    // Events that have passed but are still Confirmed/Provisional in Sonderplan.
-    // Excluded from all forecast figures. Manual check required until Xero link is built.
     uninvoicedWarnings,
     uninvoicedCount:      uninvoicedWarnings.length,
     uninvoicedTotalValue: uninvoicedWarnings.reduce((a,p) => a+p.price, 0),
@@ -976,13 +918,11 @@ async function handleBankDebug(env: Env): Promise<Response> {
   try { tokens = await getValidTokens(env); } catch (e: any) { return new Response(e.message, { status: 401 }); }
   const h = { Authorization: `Bearer ${tokens.access_token}`, "Xero-tenant-id": tokens.tenant_id, Accept: "application/json" };
 
-  // Fetch all bank accounts and return raw response so we can see what fields are present
   const res = await fetch(`${XERO_API_BASE}/Accounts?where=Type%3D%3D%22BANK%22`, { headers: h });
   const raw = await res.text();
   let parsed: any = null;
   try { parsed = JSON.parse(raw); } catch {}
 
-  // Also try fetching first account individually
   let singleRaw = null;
   const firstId = parsed?.Accounts?.[0]?.AccountID;
   if (firstId) {
@@ -993,7 +933,6 @@ async function handleBankDebug(env: Env): Promise<Response> {
   return Response.json({
     status: res.status,
     accountCount: parsed?.Accounts?.length || 0,
-    // Show all fields on first account so we can see what's available
     firstAccountAllFields: parsed?.Accounts?.[0] || null,
     singleAccountFetch: singleRaw?.Accounts?.[0] || null,
   }, { headers: { "Access-Control-Allow-Origin": "*" } });
@@ -1004,8 +943,6 @@ async function handleBankBalance(env: Env): Promise<Response> {
   try { tokens = await getValidTokens(env); } catch (e: any) { return new Response(e.message, { status: 401 }); }
   const h = { Authorization: `Bearer ${tokens.access_token}`, "Xero-tenant-id": tokens.tenant_id, Accept: "application/json" };
 
-  // Strategy 1: Accounts endpoint with EnablePaymentsToAccount filter
-  // Xero returns Balance on bank accounts when fetched individually or with correct params
   const accRes = await fetch(`${XERO_API_BASE}/Accounts?where=Type%3D%3D%22BANK%22%26%26EnablePaymentsToAccount%3D%3Dtrue`, { headers: h });
   if (accRes.ok) {
     const accData: any = await accRes.json();
@@ -1019,7 +956,6 @@ async function handleBankBalance(env: Env): Promise<Response> {
     }
   }
 
-  // Strategy 2: Fetch all bank accounts individually — Balance field appears on single-account fetch
   const allAccRes = await fetch(`${XERO_API_BASE}/Accounts?where=Type%3D%3D%22BANK%22`, { headers: h });
   if (allAccRes.ok) {
     const allAccData: any = await allAccRes.json();
@@ -1041,7 +977,6 @@ async function handleBankBalance(env: Env): Promise<Response> {
     }
   }
 
-  // Strategy 3: BalanceSheet report
   const today = new Date().toISOString().substring(0, 10);
   const bsRes = await fetch(`${XERO_API_BASE}/Reports/BalanceSheet?date=${today}`, { headers: h });
   if (bsRes.ok) {
@@ -1071,7 +1006,6 @@ async function handleBankBalance(env: Env): Promise<Response> {
     }
   }
 
-  // All strategies failed
   return Response.json({ total: null, accounts: [], source: "unavailable",
     note: "Could not retrieve bank balance — Xero account may need accounting.reports.read scope" },
     { headers: { "Access-Control-Allow-Origin": "*" } });
@@ -1169,6 +1103,52 @@ async function handleProfitAndLoss(env: Env): Promise<Response> {
   return Response.json(pnl, {headers:{"Access-Control-Allow-Origin":"*"}});
 }
 
+// ─── NEW: Xero invoices for current year (AUTHORISED + PAID, ACCREC) ──────────
+async function handleXeroInvoices(env: Env): Promise<Response> {
+  let tokens: XeroTokens;
+  try { tokens = await getValidTokens(env); } catch (e: any) { return new Response(e.message, { status: 401 }); }
+  const h = {
+    Authorization: `Bearer ${tokens.access_token}`,
+    "Xero-tenant-id": tokens.tenant_id,
+    Accept: "application/json",
+  };
+
+  const year     = new Date().getFullYear();
+  const fromDate = `${year}-01-01`;
+  const toDate   = `${year}-12-31`;
+
+  const where = encodeURIComponent(
+    `Type=="ACCREC"&&(Status=="AUTHORISED"||Status=="PAID")&&DateString>="${fromDate}"&&DateString<="${toDate}"`
+  );
+
+  const res = await fetch(`${XERO_API_BASE}/Invoices?where=${where}&order=DateString+ASC`, { headers: h });
+  if (!res.ok) {
+    return new Response(await res.text(), {
+      status: res.status,
+      headers: { "Access-Control-Allow-Origin": "*" },
+    });
+  }
+
+  const data: any = await res.json();
+  const invoices = (data.Invoices || []).map((inv: any) => ({
+    invoiceNumber: inv.InvoiceNumber || "",
+    contact:       inv.Contact?.Name || "",
+    date:          parseXeroDateFull(inv.Date),
+    dueDate:       parseXeroDateFull(inv.DueDate),
+    status:        inv.Status || "",
+    subTotal:      inv.SubTotal   || 0,   // net of VAT
+    totalTax:      inv.TotalTax   || 0,
+    total:         inv.Total      || 0,   // inc VAT
+    amountDue:     inv.AmountDue  || 0,
+    amountPaid:    inv.AmountPaid || 0,
+  }));
+
+  return Response.json(
+    { year, count: invoices.length, invoices },
+    { headers: { "Access-Control-Allow-Origin": "*" } }
+  );
+}
+
 // ─── Page serving ─────────────────────────────────────────────────────────────
 function serveDashboard(): Response {
   return new Response(DASHBOARD_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
@@ -1180,7 +1160,7 @@ function serveSettings(): Response {
   return new Response(SETTINGS_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
 }
 
-// ─── Dashboard HTML (unchanged from previous version) ─────────────────────────
+// ─── Dashboard HTML ────────────────────────────────────────────────────────────
 const DASHBOARD_HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1348,7 +1328,6 @@ async function loadInvoices(){
     if(!res.ok)throw new Error(await res.text());
     const raw=await res.json();
     const now=new Date(); now.setHours(0,0,0,0);
-    // Reshape to common format
     const byMonth={};
     for(const[month,d] of Object.entries(raw)){
       byMonth[month]={total:d.total,overdue:d.overdue,items:d.invoices.map(i=>({ref:i.ref,contact:i.contact,amount:i.amount,due:i.due,overdue:i.overdue}))};
@@ -1407,6 +1386,8 @@ loadAll();
 </script>
 </body></html>
 `;
+
+
 // ─── Forecast HTML ─────────────────────────────────────────────────────────────
 const FORECAST_HTML = `<!DOCTYPE html>
 <html lang="en">
@@ -1526,8 +1507,6 @@ header{display:flex;align-items:flex-end;justify-content:space-between;margin-bo
       <div class="pipeline-stat"><div class="pipeline-stat-label">Events in Forecast Window</div><div class="pipeline-stat-value neutral" id="sp-count">—</div></div>
       <div class="pipeline-stat"><div class="pipeline-stat-label">Opening Balance</div><div class="pipeline-stat-value neutral" id="kpi-opening">—</div></div>
     </div>
-
-    <!-- Uninvoiced warnings — only shown if past events exist -->
     <div id="uninvoiced-banner" style="display:none;margin-bottom:16px;padding:14px 18px;background:rgba(255,107,107,0.1);border:1px solid rgba(255,107,107,0.4);border-radius:8px">
       <div style="display:flex;align-items:center;justify-content:space-between;cursor:pointer" onclick="toggleUninvoiced()">
         <div>
@@ -1563,7 +1542,6 @@ header{display:flex;align-items:flex-end;justify-content:space-between;margin-bo
       <div class="pipeline-stat"><div class="pipeline-stat-label">Est. Mileage</div><div class="pipeline-stat-value" style="color:var(--orange)" id="cost-mileage">—</div></div>
       <div class="pipeline-stat"><div class="pipeline-stat-label">Est. Hotel + Subsistence</div><div class="pipeline-stat-value" style="color:var(--orange)" id="cost-hotel">—</div></div>
     </div>
-
     <div class="toggle-bar">
       <span class="toggle-label">Pipeline by:</span>
       <button class="toggle-btn active" id="btn-payment" onclick="setMode('payment')">Payment Date</button>
@@ -1576,14 +1554,12 @@ header{display:flex;align-items:flex-end;justify-content:space-between;margin-bo
       <button class="toggle-btn active-orange" id="btn-costs-on" onclick="setCosts(true)">Costs On</button>
       <button class="toggle-btn" id="btn-costs-off" onclick="setCosts(false)">Costs Off</button>
     </div>
-
     <div class="kpi-row">
       <div class="kpi-card"><div class="kpi-label">Confirmed Inflows</div><div class="kpi-value positive" id="kpi-confirmed">—</div><div class="kpi-sub" id="kpi-confirmed-sub">Xero invoices</div></div>
       <div class="kpi-card"><div class="kpi-label">Pipeline in Window</div><div class="kpi-value neutral" id="kpi-pipeline">—</div><div class="kpi-sub" id="kpi-pipeline-sub">Sonderplan events</div></div>
       <div class="kpi-card"><div class="kpi-label">Est. Event Costs</div><div class="kpi-value" style="color:var(--orange)" id="kpi-costs">—</div><div class="kpi-sub" id="kpi-costs-sub">in forecast window</div></div>
       <div class="kpi-card"><div class="kpi-label">Closing Balance</div><div class="kpi-value neutral" id="kpi-closing">—</div><div class="kpi-sub">End of week 34</div></div>
     </div>
-
     <div class="card">
       <div class="card-header"><span class="card-title">Weekly Cash Position</span><span class="card-badge" id="chart-badge">8-month rolling</span></div>
       <div class="chart-wrap"><canvas id="forecastChart"></canvas></div>
@@ -1608,265 +1584,20 @@ header{display:flex;align-items:flex-end;justify-content:space-between;margin-bo
 const fmt=n=>new Intl.NumberFormat('en-GB',{style:'currency',currency:'GBP',maximumFractionDigits:0}).format(n);
 const fmtDec=n=>new Intl.NumberFormat('en-GB',{style:'currency',currency:'GBP',minimumFractionDigits:2}).format(n);
 Chart.defaults.color='#6b6b8a';Chart.defaults.borderColor='#2a2a40';Chart.defaults.font.family="'DM Mono',monospace";Chart.defaults.font.size=11;
-
-let forecastData = null;
-let currentMode  = 'payment';
-let currentCase  = 'best';
-let costsOn      = true;
-
-function toggleUninvoiced(){
-  const detail = document.getElementById('uninvoiced-detail');
-  const label  = document.getElementById('uninvoiced-toggle-label');
-  const open   = detail.style.display === 'none';
-  detail.style.display = open ? 'block' : 'none';
-  label.textContent    = open ? 'Hide ▲' : 'Show ▼';
-}
-
-function typeClass(t){
-  if(t==='Invoice')           return 'type-invoice';
-  if(t==='Bill')              return 'type-bill';
-  if(t==='Est. Monthly')      return 'type-monthly';
-  if(t==='Est. Weekly')       return 'type-weekly';
-  if(t==='Confirmed Event')   return 'type-confirmed';
-  if(t==='Est. Event Cost')   return 'type-cost';
-  return 'type-provisional';
-}
-
-function renderDetail(wi){
-  const week = forecastData._weeks[wi];
-  document.querySelectorAll('.week-col').forEach((c,i)=>c.classList.toggle('active',i===wi));
-  const panel = document.getElementById('detail-panel');
-  panel.classList.add('visible');
-  document.getElementById('detail-title').textContent = week.label + ' (' + week.weekStart + ' \u2192 ' + week.weekEnd + ')';
-
-  const xeroIn = week.inflows.filter(i=>i.source==='xero');
-  const spIn   = week.inflows.filter(i=>i.source==='sonderplan');
-  document.getElementById('detail-in-title').textContent =
-    'Inflows \u2014 ' + fmt(week.totalIn) +
-    (week.pipelineIn > 0 ? ' (' + fmt(week.confirmedIn) + ' confirmed + ' + fmt(week.pipelineIn) + ' pipeline)' : '');
-
-  const makeInRow = i =>
-    '<div class="detail-row"><span class="dr-ref">' + i.ref + '</span>' +
-    '<div class="dr-name">' + i.contact + (i.priceFlag && i.priceFlag !== 'Clean' ? ' <span style="color:var(--muted);font-size:0.58rem">[' + i.priceFlag + ']</span>' : '') + '</div>' +
-    '<span class="dr-amt">' + fmtDec(i.amount) + '</span>' +
-    '<span class="dr-type ' + typeClass(i.type) + '">' + i.type + '</span></div>';
-
-  const makeCostRow = i =>
-    '<div class="detail-row"><span class="dr-ref">' + i.ref + '</span>' +
-    '<div class="dr-name">' + i.contact + '<div class="dr-breakdown">' + (i.breakdown||'') + '</div></div>' +
-    '<span class="dr-amt">' + fmtDec(i.amount) + '</span>' +
-    '<span class="dr-type type-cost">Est. Cost</span></div>';
-
-  let inHtml = '';
-  if(xeroIn.length){ inHtml += '<div style="font-size:0.6rem;color:var(--muted);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:6px">Confirmed (Xero)</div>' + xeroIn.map(makeInRow).join(''); }
-  if(spIn.length){   inHtml += '<div style="font-size:0.6rem;color:var(--accent);letter-spacing:0.1em;text-transform:uppercase;margin:' + (xeroIn.length?'12px':'0') + 'px 0 6px">Pipeline (Sonderplan)</div>' + spIn.map(makeInRow).join(''); }
-  if(!inHtml) inHtml = '<div class="empty-state">No inflows this week</div>';
-  document.getElementById('detail-inflows').innerHTML = inHtml;
-
-  const costOut  = week.outflows.filter(o=>o.source==='staff-estimate');
-  const otherOut = week.outflows.filter(o=>o.source!=='staff-estimate');
-  const costSum  = costOut.reduce((a,o)=>a+o.amount,0);
-  document.getElementById('detail-out-title').textContent =
-    'Outflows \u2014 ' + fmt(week.totalOut) +
-    (costSum > 0 ? ' (incl. ' + fmt(costSum) + ' est. costs)' : '');
-
-  let outHtml = '';
-  if(otherOut.length){ outHtml += otherOut.map(o => o.source==='staff-estimate' ? makeCostRow(o) : makeInRow(o)).join(''); }
-  if(costOut.length){  outHtml += '<div style="font-size:0.6rem;color:var(--orange);letter-spacing:0.1em;text-transform:uppercase;margin:' + (otherOut.length?'12px':'0') + 'px 0 6px">Est. Event Costs</div>' + costOut.map(makeCostRow).join(''); }
-  document.getElementById('detail-outflows').innerHTML = outHtml || '<div class="empty-state">No outflows this week</div>';
-
-  panel.scrollIntoView({behavior:'smooth',block:'nearest'});
-}
-
-function closeDetail(){
-  document.getElementById('detail-panel').classList.remove('visible');
-  document.querySelectorAll('.week-col').forEach(c=>c.classList.remove('active'));
-}
-
-function setMode(m){ currentMode=m; document.getElementById('btn-payment').classList.toggle('active',m==='payment'); document.getElementById('btn-event').classList.toggle('active',m==='event'); if(forecastData)rebuild(); }
-function setCaseMode(m){ currentCase=m; document.getElementById('btn-best').classList.toggle('active',m==='best'); document.getElementById('btn-worst').classList.toggle('active',m==='worst'); if(forecastData)rebuild(); }
-function setCosts(on){ costsOn=on; document.getElementById('btn-costs-on').className='toggle-btn '+(on?'active-orange':''); document.getElementById('btn-costs-off').className='toggle-btn '+(on?'':'active-orange'); if(forecastData)rebuild(); }
-
-function getWeekIndex(dateStr, forecastFrom){
-  return Math.floor((new Date(dateStr).getTime() - new Date(forecastFrom).getTime()) / (86400000*7));
-}
-
-function rebuild(){
-  const data  = forecastData;
-  const weeks = JSON.parse(JSON.stringify(data.weeks));
-
-  // Strip all sonderplan contributions, re-add based on current mode/case/costs
-  for(const w of weeks){
-    w.inflows  = w.inflows.filter(i => i.source !== 'sonderplan');
-    w.outflows = w.outflows.filter(o => o.source !== 'staff-estimate');
-    w.totalIn  = w.inflows.reduce((a,i)=>a+i.amount, 0);
-    w.totalOut = w.outflows.reduce((a,o)=>a+o.amount, 0);
-    w.pipelineIn = 0; w.estimatedCosts = 0;
-  }
-
-  const items = (data.pipeline.allItems || []).filter(p => currentCase === 'best' || p.status === 'Confirmed');
-
-  for(const item of items){
-    const inDate = currentMode === 'event' ? item.eventStart : item.paymentDate;
-    const wiIn   = getWeekIndex(inDate, data.forecastFrom);
-    if(wiIn >= 0 && wiIn < 34){
-      weeks[wiIn].inflows.push({ ref:item.id, contact:item.name, amount:item.price, due:inDate,
-        type: item.status==='Confirmed' ? 'Confirmed Event' : 'Provisional Event',
-        source:'sonderplan', status:item.status, priceFlag:item.priceFlag });
-      weeks[wiIn].totalIn    += item.price;
-      weeks[wiIn].pipelineIn += item.price;
-    }
-    if(costsOn && item.costs && item.costs.total > 0){
-      const wiCost = getWeekIndex(item.eventStart, data.forecastFrom);
-      if(wiCost >= 0 && wiCost < 34){
-        weeks[wiCost].outflows.push({ ref:item.id, contact:item.name, amount:item.costs.total,
-          due:item.eventStart, type:'Est. Event Cost', source:'staff-estimate',
-          unitCount:item.unitCount, eventDays:item.eventDays,
-          miles:item.costs.miles, nights:item.costs.nights, breakdown:item.costs.breakdown });
-        weeks[wiCost].totalOut        += item.costs.total;
-        weeks[wiCost].estimatedCosts  += item.costs.total;
-      }
-    }
-  }
-
-  let running = data.openingBalance;
-  for(const w of weeks){ w.net = w.totalIn - w.totalOut; running += w.net; w.runningBalance = running; }
-
-  // Stash for detail panel access
-  data._weeks = weeks;
-
-  renderChart(data, weeks);
-  renderWeekGrid(data, weeks);
-  renderKPIs(data, weeks);
-}
-
-function renderKPIs(data, weeks){
-  const confirmedIn  = weeks.reduce((a,w)=>a+w.confirmedIn, 0);
-  const pipelineIn   = weeks.reduce((a,w)=>a+w.pipelineIn, 0);
-  const estimCosts   = weeks.reduce((a,w)=>a+w.estimatedCosts, 0);
-  const closing      = weeks[weeks.length-1].runningBalance;
-
-  document.getElementById('kpi-opening').textContent  = fmt(data.openingBalance);
-  document.getElementById('kpi-opening').className    = 'pipeline-stat-value ' + (data.openingBalance>=0?'positive':'negative');
-  document.getElementById('kpi-confirmed').textContent = fmt(confirmedIn);
-  document.getElementById('kpi-confirmed-sub').textContent = weeks.reduce((a,w)=>a+w.inflows.filter(i=>i.source==='xero').length,0) + ' invoices';
-  document.getElementById('kpi-pipeline').textContent  = fmt(pipelineIn);
-  document.getElementById('kpi-pipeline-sub').textContent  = weeks.reduce((a,w)=>a+w.inflows.filter(i=>i.source==='sonderplan').length,0) + ' events in window';
-  document.getElementById('kpi-costs').textContent    = fmt(estimCosts);
-  document.getElementById('kpi-costs-sub').textContent = costsOn ? 'est. event costs shown' : 'costs hidden';
-  const clEl = document.getElementById('kpi-closing'); clEl.textContent = fmt(closing); clEl.className = 'kpi-value ' + (closing>=0?'positive':'negative');
-}
-
-function renderChart(data, weeks){
-  if(window._fChart) window._fChart.destroy();
-  window._fChart = new Chart(document.getElementById('forecastChart').getContext('2d'), {
-    type:'bar',
-    data:{
-      labels: weeks.map(w=>w.label),
-      datasets:[
-        {label:'Confirmed In (Xero)',  data:weeks.map(w=>w.confirmedIn),    backgroundColor:'rgba(78,205,196,0.75)', borderRadius:0, borderSkipped:false, stack:'in'},
-        {label:'Pipeline In (SP)',     data:weeks.map(w=>w.pipelineIn),     backgroundColor:'rgba(124,106,247,0.6)', borderRadius:3, borderSkipped:false, stack:'in'},
-        {label:'Est. Event Costs',     data:weeks.map(w=>w.estimatedCosts), backgroundColor:'rgba(255,159,67,0.7)',  borderRadius:0, borderSkipped:false, stack:'out'},
-        {label:'Other Outflows',       data:weeks.map(w=>w.totalOut-w.estimatedCosts), backgroundColor:'rgba(255,107,107,0.65)', borderRadius:3, borderSkipped:false, stack:'out'},
-        {label:'Balance', data:weeks.map(w=>w.runningBalance), type:'line',
-          borderColor:'#ffd93d', backgroundColor:'rgba(255,217,61,0.05)', borderWidth:2,
-          pointRadius:3, pointBackgroundColor:weeks.map(w=>w.runningBalance>=0?'#ffd93d':'#ff6b6b'),
-          fill:true, tension:0.3, yAxisID:'y1', stack:undefined},
-      ]
-    },
-    options:{
-      responsive:true, maintainAspectRatio:false, interaction:{mode:'index'},
-      plugins:{
-        legend:{display:true,position:'bottom',labels:{boxWidth:10,padding:12}},
-        tooltip:{callbacks:{afterBody:items=>{const wi=items[0].dataIndex; return ['Net: '+fmt(weeks[wi].net),' Conf: '+fmt(weeks[wi].confirmedIn),' Pipeline: '+fmt(weeks[wi].pipelineIn),' Est.Costs: '+fmt(weeks[wi].estimatedCosts)];}}}
-      },
-      scales:{
-        x:{grid:{color:'#2a2a40'}},
-        y:{grid:{color:'#2a2a40'}, ticks:{callback:v=>fmt(v)}, title:{display:true,text:'In / Out',color:'#6b6b8a',font:{size:10}}, stacked:true},
-        y1:{position:'right', grid:{display:false}, ticks:{callback:v=>fmt(v)}, title:{display:true,text:'Balance',color:'#6b6b8a',font:{size:10}}},
-      }
-    }
-  });
-}
-
-function renderWeekGrid(data, weeks){
-  document.getElementById('week-grid').innerHTML = weeks.map((w,i)=>{
-    const danger   = w.runningBalance < 0;
-    const netClass = w.net > 0 ? 'net-positive' : w.net < 0 ? 'net-negative' : 'net-zero';
-    return '<div class="week-col'+(danger?' danger':'')+'" onclick="renderDetail('+i+')">' +
-      '<div class="week-label">'+w.label+'</div>' +
-      '<div class="week-in">\u2191 '+fmt(w.confirmedIn)+'</div>' +
-      (w.pipelineIn>0 ? '<div class="week-pipeline">\u25C6 '+fmt(w.pipelineIn)+'</div>' : '') +
-      (w.estimatedCosts>0 ? '<div class="week-costs">\u25BC '+fmt(w.estimatedCosts)+'</div>' : '') +
-      '<div class="week-out">\u2193 '+fmt(w.totalOut)+'</div>' +
-      '<div class="week-net '+netClass+'">'+(w.net>=0?'+':'')+fmt(w.net)+'</div>' +
-      '<div class="week-balance">Bal '+fmt(w.runningBalance)+'</div></div>';
-  }).join('');
-}
-
-async function loadForecast(){
-  try{
-    const res = await fetch('/api/forecast');
-    if(!res.ok) throw new Error(await res.text());
-    forecastData = await res.json();
-    document.getElementById('loading-state').style.display = 'none';
-    document.getElementById('forecast-content').style.display = 'block';
-
-    // Pipeline banner
-    document.getElementById('sp-confirmed').textContent  = fmt(forecastData.pipeline.confirmedTotal);
-    document.getElementById('sp-provisional').textContent = fmt(forecastData.pipeline.provisionalTotal);
-    document.getElementById('sp-count').textContent       = forecastData.pipeline.inWindowCount + ' events';
-
-    // Uninvoiced warnings banner
-    const warnings = forecastData.uninvoicedWarnings || [];
-    if(warnings.length > 0){
-      document.getElementById('uninvoiced-banner').style.display = 'block';
-      document.getElementById('uninvoiced-summary').textContent =
-        warnings.length + ' event' + (warnings.length===1?'':'s') + ' — ' +
-        fmt(forecastData.uninvoicedTotalValue) + ' total value — not in forecast figures';
-      const statusBadge = s => '<span style="font-size:0.6rem;padding:2px 6px;border-radius:3px;background:rgba(255,107,107,0.15);color:var(--red)">'+s+'</span>';
-      const flagColour  = f => f==='Clean'?'var(--green)':f==='No Quote'?'var(--red)':'var(--accent4)';
-      document.getElementById('uninvoiced-tbody').innerHTML = warnings.map(p =>
-        '<tr>' +
-        '<td style="padding:7px 0;border-bottom:1px solid rgba(42,42,64,0.4)">'+p.name+'</td>' +
-        '<td style="padding:7px 0;border-bottom:1px solid rgba(42,42,64,0.4)">'+statusBadge(p.status)+'</td>' +
-        '<td style="padding:7px 0;border-bottom:1px solid rgba(42,42,64,0.4);color:var(--muted)">'+p.eventStart+' → '+p.eventEnd+'</td>' +
-        '<td style="padding:7px 0;border-bottom:1px solid rgba(42,42,64,0.4);text-align:right;font-family:Syne,sans-serif;font-weight:600">'+fmtDec(p.price)+'</td>' +
-        '<td style="padding:7px 0;border-bottom:1px solid rgba(42,42,64,0.4);color:'+flagColour(p.priceFlag)+';font-size:0.62rem;padding-left:12px">'+p.priceFlag+'</td>' +
-        '</tr>'
-      ).join('');
-    }
-
-    // Cost banner — aggregate over all pipeline items
-    const allItems = forecastData.pipeline.allItems || [];
-    const totalCosts     = allItems.reduce((a,p)=>a+(p.costs?.total||0), 0);
-    const totalWages     = allItems.reduce((a,p)=>a+(p.costs?.wages||0), 0);
-    const totalMileage   = allItems.reduce((a,p)=>a+(p.costs?.mileage||0), 0);
-    const totalHotelSubs = allItems.reduce((a,p)=>a+(p.costs?.hotel||0)+(p.costs?.subsistence||0), 0);
-    document.getElementById('cost-total').textContent    = fmt(totalCosts);
-    document.getElementById('cost-wages').textContent    = fmt(totalWages);
-    document.getElementById('cost-mileage').textContent  = fmt(totalMileage);
-    document.getElementById('cost-hotel').textContent    = fmt(totalHotelSubs);
-
-    // Beyond window table
-    const beyond = forecastData.pipeline.beyondWindow || [];
-    document.getElementById('beyond-badge').textContent = beyond.length + ' events';
-    const statusBadge = s => '<span style="font-size:0.6rem;padding:2px 6px;border-radius:3px;background:rgba(124,106,247,0.15);color:var(--accent)">'+s+'</span>';
-    document.getElementById('beyond-tbody').innerHTML = beyond.length
-      ? beyond.map(p=>'<tr><td>'+p.name+'</td><td>'+statusBadge(p.status)+'</td><td>'+p.eventStart+'</td><td>'+p.paymentDate+'</td><td style="color:var(--muted)">'+p.unitCount+'u</td><td style="text-align:right;color:var(--orange)">'+fmt(p.costs?.total||0)+'</td><td style="text-align:right;font-family:Syne,sans-serif;font-weight:600">'+fmtDec(p.price)+'</td></tr>').join('')
-      : '<tr><td colspan="7" style="color:var(--muted);padding:12px 0">No events beyond the forecast window</td></tr>';
-
-    rebuild();
-
-    // Auto-open first active week
-    const firstActive = (forecastData._weeks||[]).findIndex(w=>w.inflows.length>0||w.outflows.length>0);
-    if(firstActive >= 0) renderDetail(firstActive);
-
-  } catch(e){
-    document.getElementById('loading-state').innerHTML = '<div class="error-text">Error: '+e.message+'</div>';
-  }
-}
-
+let forecastData=null,currentMode='payment',currentCase='best',costsOn=true;
+function toggleUninvoiced(){const detail=document.getElementById('uninvoiced-detail'),label=document.getElementById('uninvoiced-toggle-label'),open=detail.style.display==='none';detail.style.display=open?'block':'none';label.textContent=open?'Hide ▲':'Show ▼';}
+function typeClass(t){if(t==='Invoice')return 'type-invoice';if(t==='Bill')return 'type-bill';if(t==='Est. Monthly')return 'type-monthly';if(t==='Est. Weekly')return 'type-weekly';if(t==='Confirmed Event')return 'type-confirmed';if(t==='Est. Event Cost')return 'type-cost';return 'type-provisional';}
+function renderDetail(wi){const week=forecastData._weeks[wi];document.querySelectorAll('.week-col').forEach((c,i)=>c.classList.toggle('active',i===wi));const panel=document.getElementById('detail-panel');panel.classList.add('visible');document.getElementById('detail-title').textContent=week.label+' ('+week.weekStart+' \u2192 '+week.weekEnd+')';const xeroIn=week.inflows.filter(i=>i.source==='xero'),spIn=week.inflows.filter(i=>i.source==='sonderplan');document.getElementById('detail-in-title').textContent='Inflows \u2014 '+fmt(week.totalIn)+(week.pipelineIn>0?' ('+fmt(week.confirmedIn)+' confirmed + '+fmt(week.pipelineIn)+' pipeline)':'');const makeInRow=i=>'<div class="detail-row"><span class="dr-ref">'+i.ref+'</span><div class="dr-name">'+i.contact+(i.priceFlag&&i.priceFlag!=='Clean'?' <span style="color:var(--muted);font-size:0.58rem">['+i.priceFlag+']</span>':'')+'</div><span class="dr-amt">'+fmtDec(i.amount)+'</span><span class="dr-type '+typeClass(i.type)+'">'+i.type+'</span></div>';const makeCostRow=i=>'<div class="detail-row"><span class="dr-ref">'+i.ref+'</span><div class="dr-name">'+i.contact+'<div class="dr-breakdown">'+(i.breakdown||'')+'</div></div><span class="dr-amt">'+fmtDec(i.amount)+'</span><span class="dr-type type-cost">Est. Cost</span></div>';let inHtml='';if(xeroIn.length){inHtml+='<div style="font-size:0.6rem;color:var(--muted);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:6px">Confirmed (Xero)</div>'+xeroIn.map(makeInRow).join('');}if(spIn.length){inHtml+='<div style="font-size:0.6rem;color:var(--accent);letter-spacing:0.1em;text-transform:uppercase;margin:'+(xeroIn.length?'12px':'0')+'px 0 6px">Pipeline (Sonderplan)</div>'+spIn.map(makeInRow).join('');}if(!inHtml)inHtml='<div class="empty-state">No inflows this week</div>';document.getElementById('detail-inflows').innerHTML=inHtml;const costOut=week.outflows.filter(o=>o.source==='staff-estimate'),otherOut=week.outflows.filter(o=>o.source!=='staff-estimate'),costSum=costOut.reduce((a,o)=>a+o.amount,0);document.getElementById('detail-out-title').textContent='Outflows \u2014 '+fmt(week.totalOut)+(costSum>0?' (incl. '+fmt(costSum)+' est. costs)':'');let outHtml='';if(otherOut.length){outHtml+=otherOut.map(o=>o.source==='staff-estimate'?makeCostRow(o):makeInRow(o)).join('');}if(costOut.length){outHtml+='<div style="font-size:0.6rem;color:var(--orange);letter-spacing:0.1em;text-transform:uppercase;margin:'+(otherOut.length?'12px':'0')+'px 0 6px">Est. Event Costs</div>'+costOut.map(makeCostRow).join('');}document.getElementById('detail-outflows').innerHTML=outHtml||'<div class="empty-state">No outflows this week</div>';panel.scrollIntoView({behavior:'smooth',block:'nearest'});}
+function closeDetail(){document.getElementById('detail-panel').classList.remove('visible');document.querySelectorAll('.week-col').forEach(c=>c.classList.remove('active'));}
+function setMode(m){currentMode=m;document.getElementById('btn-payment').classList.toggle('active',m==='payment');document.getElementById('btn-event').classList.toggle('active',m==='event');if(forecastData)rebuild();}
+function setCaseMode(m){currentCase=m;document.getElementById('btn-best').classList.toggle('active',m==='best');document.getElementById('btn-worst').classList.toggle('active',m==='worst');if(forecastData)rebuild();}
+function setCosts(on){costsOn=on;document.getElementById('btn-costs-on').className='toggle-btn '+(on?'active-orange':'');document.getElementById('btn-costs-off').className='toggle-btn '+(on?'':'active-orange');if(forecastData)rebuild();}
+function getWeekIndex(dateStr,forecastFrom){return Math.floor((new Date(dateStr).getTime()-new Date(forecastFrom).getTime())/(86400000*7));}
+function rebuild(){const data=forecastData,weeks=JSON.parse(JSON.stringify(data.weeks));for(const w of weeks){w.inflows=w.inflows.filter(i=>i.source!=='sonderplan');w.outflows=w.outflows.filter(o=>o.source!=='staff-estimate');w.totalIn=w.inflows.reduce((a,i)=>a+i.amount,0);w.totalOut=w.outflows.reduce((a,o)=>a+o.amount,0);w.pipelineIn=0;w.estimatedCosts=0;}const items=(data.pipeline.allItems||[]).filter(p=>currentCase==='best'||p.status==='Confirmed');for(const item of items){const inDate=currentMode==='event'?item.eventStart:item.paymentDate,wiIn=getWeekIndex(inDate,data.forecastFrom);if(wiIn>=0&&wiIn<34){weeks[wiIn].inflows.push({ref:item.id,contact:item.name,amount:item.price,due:inDate,type:item.status==='Confirmed'?'Confirmed Event':'Provisional Event',source:'sonderplan',status:item.status,priceFlag:item.priceFlag});weeks[wiIn].totalIn+=item.price;weeks[wiIn].pipelineIn+=item.price;}if(costsOn&&item.costs&&item.costs.total>0){const wiCost=getWeekIndex(item.eventStart,data.forecastFrom);if(wiCost>=0&&wiCost<34){weeks[wiCost].outflows.push({ref:item.id,contact:item.name,amount:item.costs.total,due:item.eventStart,type:'Est. Event Cost',source:'staff-estimate',unitCount:item.unitCount,eventDays:item.eventDays,miles:item.costs.miles,nights:item.costs.nights,breakdown:item.costs.breakdown});weeks[wiCost].totalOut+=item.costs.total;weeks[wiCost].estimatedCosts+=item.costs.total;}}}let running=data.openingBalance;for(const w of weeks){w.net=w.totalIn-w.totalOut;running+=w.net;w.runningBalance=running;}data._weeks=weeks;renderChart(data,weeks);renderWeekGrid(data,weeks);renderKPIs(data,weeks);}
+function renderKPIs(data,weeks){const confirmedIn=weeks.reduce((a,w)=>a+w.confirmedIn,0),pipelineIn=weeks.reduce((a,w)=>a+w.pipelineIn,0),estimCosts=weeks.reduce((a,w)=>a+w.estimatedCosts,0),closing=weeks[weeks.length-1].runningBalance;document.getElementById('kpi-opening').textContent=fmt(data.openingBalance);document.getElementById('kpi-opening').className='pipeline-stat-value '+(data.openingBalance>=0?'positive':'negative');document.getElementById('kpi-confirmed').textContent=fmt(confirmedIn);document.getElementById('kpi-confirmed-sub').textContent=weeks.reduce((a,w)=>a+w.inflows.filter(i=>i.source==='xero').length,0)+' invoices';document.getElementById('kpi-pipeline').textContent=fmt(pipelineIn);document.getElementById('kpi-pipeline-sub').textContent=weeks.reduce((a,w)=>a+w.inflows.filter(i=>i.source==='sonderplan').length,0)+' events in window';document.getElementById('kpi-costs').textContent=fmt(estimCosts);document.getElementById('kpi-costs-sub').textContent=costsOn?'est. event costs shown':'costs hidden';const clEl=document.getElementById('kpi-closing');clEl.textContent=fmt(closing);clEl.className='kpi-value '+(closing>=0?'positive':'negative');}
+function renderChart(data,weeks){if(window._fChart)window._fChart.destroy();window._fChart=new Chart(document.getElementById('forecastChart').getContext('2d'),{type:'bar',data:{labels:weeks.map(w=>w.label),datasets:[{label:'Confirmed In (Xero)',data:weeks.map(w=>w.confirmedIn),backgroundColor:'rgba(78,205,196,0.75)',borderRadius:0,borderSkipped:false,stack:'in'},{label:'Pipeline In (SP)',data:weeks.map(w=>w.pipelineIn),backgroundColor:'rgba(124,106,247,0.6)',borderRadius:3,borderSkipped:false,stack:'in'},{label:'Est. Event Costs',data:weeks.map(w=>w.estimatedCosts),backgroundColor:'rgba(255,159,67,0.7)',borderRadius:0,borderSkipped:false,stack:'out'},{label:'Other Outflows',data:weeks.map(w=>w.totalOut-w.estimatedCosts),backgroundColor:'rgba(255,107,107,0.65)',borderRadius:3,borderSkipped:false,stack:'out'},{label:'Balance',data:weeks.map(w=>w.runningBalance),type:'line',borderColor:'#ffd93d',backgroundColor:'rgba(255,217,61,0.05)',borderWidth:2,pointRadius:3,pointBackgroundColor:weeks.map(w=>w.runningBalance>=0?'#ffd93d':'#ff6b6b'),fill:true,tension:0.3,yAxisID:'y1',stack:undefined}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index'},plugins:{legend:{display:true,position:'bottom',labels:{boxWidth:10,padding:12}},tooltip:{callbacks:{afterBody:items=>{const wi=items[0].dataIndex;return['Net: '+fmt(weeks[wi].net),' Conf: '+fmt(weeks[wi].confirmedIn),' Pipeline: '+fmt(weeks[wi].pipelineIn),' Est.Costs: '+fmt(weeks[wi].estimatedCosts)];},}}},scales:{x:{grid:{color:'#2a2a40'}},y:{grid:{color:'#2a2a40'},ticks:{callback:v=>fmt(v)},title:{display:true,text:'In / Out',color:'#6b6b8a',font:{size:10}},stacked:true},y1:{position:'right',grid:{display:false},ticks:{callback:v=>fmt(v)},title:{display:true,text:'Balance',color:'#6b6b8a',font:{size:10}}}}}});}
+function renderWeekGrid(data,weeks){document.getElementById('week-grid').innerHTML=weeks.map((w,i)=>{const danger=w.runningBalance<0,netClass=w.net>0?'net-positive':w.net<0?'net-negative':'net-zero';return'<div class="week-col'+(danger?' danger':'')+'" onclick="renderDetail('+i+')">'+'<div class="week-label">'+w.label+'</div>'+'<div class="week-in">\u2191 '+fmt(w.confirmedIn)+'</div>'+(w.pipelineIn>0?'<div class="week-pipeline">\u25C6 '+fmt(w.pipelineIn)+'</div>':'')+(w.estimatedCosts>0?'<div class="week-costs">\u25BC '+fmt(w.estimatedCosts)+'</div>':'')+'<div class="week-out">\u2193 '+fmt(w.totalOut)+'</div>'+'<div class="week-net '+netClass+'">'+(w.net>=0?'+':'')+fmt(w.net)+'</div>'+'<div class="week-balance">Bal '+fmt(w.runningBalance)+'</div></div>';}).join('');}
+async function loadForecast(){try{const res=await fetch('/api/forecast');if(!res.ok)throw new Error(await res.text());forecastData=await res.json();document.getElementById('loading-state').style.display='none';document.getElementById('forecast-content').style.display='block';document.getElementById('sp-confirmed').textContent=fmt(forecastData.pipeline.confirmedTotal);document.getElementById('sp-provisional').textContent=fmt(forecastData.pipeline.provisionalTotal);document.getElementById('sp-count').textContent=forecastData.pipeline.inWindowCount+' events';const warnings=forecastData.uninvoicedWarnings||[];if(warnings.length>0){document.getElementById('uninvoiced-banner').style.display='block';document.getElementById('uninvoiced-summary').textContent=warnings.length+' event'+(warnings.length===1?'':'s')+' — '+fmt(forecastData.uninvoicedTotalValue)+' total value — not in forecast figures';const statusBadge=s=>'<span style="font-size:0.6rem;padding:2px 6px;border-radius:3px;background:rgba(255,107,107,0.15);color:var(--red)">'+s+'</span>';const flagColour=f=>f==='Clean'?'var(--green)':f==='No Quote'?'var(--red)':'var(--accent4)';document.getElementById('uninvoiced-tbody').innerHTML=warnings.map(p=>'<tr><td style="padding:7px 0;border-bottom:1px solid rgba(42,42,64,0.4)">'+p.name+'</td><td style="padding:7px 0;border-bottom:1px solid rgba(42,42,64,0.4)">'+statusBadge(p.status)+'</td><td style="padding:7px 0;border-bottom:1px solid rgba(42,42,64,0.4);color:var(--muted)">'+p.eventStart+' \u2192 '+p.eventEnd+'</td><td style="padding:7px 0;border-bottom:1px solid rgba(42,42,64,0.4);text-align:right;font-family:Syne,sans-serif;font-weight:600">'+fmtDec(p.price)+'</td><td style="padding:7px 0;border-bottom:1px solid rgba(42,42,64,0.4);color:'+flagColour(p.priceFlag)+';font-size:0.62rem;padding-left:12px">'+p.priceFlag+'</td></tr>').join('');}const allItems=forecastData.pipeline.allItems||[];const totalCosts=allItems.reduce((a,p)=>a+(p.costs?.total||0),0),totalWages=allItems.reduce((a,p)=>a+(p.costs?.wages||0),0),totalMileage=allItems.reduce((a,p)=>a+(p.costs?.mileage||0),0),totalHotelSubs=allItems.reduce((a,p)=>a+(p.costs?.hotel||0)+(p.costs?.subsistence||0),0);document.getElementById('cost-total').textContent=fmt(totalCosts);document.getElementById('cost-wages').textContent=fmt(totalWages);document.getElementById('cost-mileage').textContent=fmt(totalMileage);document.getElementById('cost-hotel').textContent=fmt(totalHotelSubs);const beyond=forecastData.pipeline.beyondWindow||[];document.getElementById('beyond-badge').textContent=beyond.length+' events';const statusBadge=s=>'<span style="font-size:0.6rem;padding:2px 6px;border-radius:3px;background:rgba(124,106,247,0.15);color:var(--accent)">'+s+'</span>';document.getElementById('beyond-tbody').innerHTML=beyond.length?beyond.map(p=>'<tr><td>'+p.name+'</td><td>'+statusBadge(p.status)+'</td><td>'+p.eventStart+'</td><td>'+p.paymentDate+'</td><td style="color:var(--muted)">'+p.unitCount+'u</td><td style="text-align:right;color:var(--orange)">'+fmt(p.costs?.total||0)+'</td><td style="text-align:right;font-family:Syne,sans-serif;font-weight:600">'+fmtDec(p.price)+'</td></tr>').join(''):'<tr><td colspan="7" style="color:var(--muted);padding:12px 0">No events beyond the forecast window</td></tr>';rebuild();const firstActive=(forecastData._weeks||[]).findIndex(w=>w.inflows.length>0||w.outflows.length>0);if(firstActive>=0)renderDetail(firstActive);}catch(e){document.getElementById('loading-state').innerHTML='<div class="error-text">Error: '+e.message+'</div>';}}
 loadForecast();
 </script>
 </body></html>
@@ -1936,108 +1667,52 @@ input:checked+.slider::before{transform:translateX(20px)}
       <a href="/forecast" class="nav-link">Forecast</a>
     </div>
   </header>
-
   <div id="loading-msg" class="loading-text" style="margin-bottom:20px">Loading current settings…</div>
-
   <div id="settings-form" style="display:none">
     <div class="card">
       <div class="card-title">Base Location & Travel</div>
       <div class="card-desc">Where vehicles are based, and how driving time and mileage are calculated.</div>
       <div class="field-group" style="margin-bottom:16px">
-        <div class="field">
-          <label class="field-label">Base postcode</label>
-          <input id="basePostcode" type="text" placeholder="GL10 3RF">
-          <div class="field-hint">Geocoded via postcodes.io — changing this clears the distance cache</div>
-        </div>
-        <div class="field">
-          <label class="field-label">Driving speed (mph)</label>
-          <input id="drivingSpeedMph" type="number" step="5" min="10" placeholder="40">
-          <div class="field-hint">Used to convert distance → driving hours paid. 40mph recommended for vans/trailers.</div>
-        </div>
+        <div class="field"><label class="field-label">Base postcode</label><input id="basePostcode" type="text" placeholder="GL10 3RF"><div class="field-hint">Geocoded via postcodes.io — changing this clears the distance cache</div></div>
+        <div class="field"><label class="field-label">Driving speed (mph)</label><input id="drivingSpeedMph" type="number" step="5" min="10" placeholder="40"><div class="field-hint">Used to convert distance → driving hours paid. 40mph recommended for vans/trailers.</div></div>
       </div>
       <div class="field-group">
-        <div class="field">
-          <label class="field-label">Mileage rate (£/mile)</label>
-          <input id="mileageRatePerMile" type="number" step="0.01" min="0" placeholder="0.45">
-          <div class="field-hint">HMRC approved: £0.45/mile — applied to return trip × units</div>
-        </div>
-        <div class="field">
-          <label class="field-label">Hotel threshold (miles)</label>
-          <input id="hotelThresholdMiles" type="number" step="5" min="0" placeholder="50">
-          <div class="field-hint">Hotel added if one-way distance exceeds this, or event is multi-day</div>
-        </div>
+        <div class="field"><label class="field-label">Mileage rate (£/mile)</label><input id="mileageRatePerMile" type="number" step="0.01" min="0" placeholder="0.45"><div class="field-hint">HMRC approved: £0.45/mile — applied to return trip × units</div></div>
+        <div class="field"><label class="field-label">Hotel threshold (miles)</label><input id="hotelThresholdMiles" type="number" step="5" min="0" placeholder="50"><div class="field-hint">Hotel added if one-way distance exceeds this, or event is multi-day</div></div>
       </div>
     </div>
-
     <div class="card">
       <div class="card-title">Staff Costs</div>
       <div class="card-desc">1 staff per unit. Paid hours = operational hours + driving time (return) + setup/breakdown + contingency.</div>
       <div class="field-group" style="margin-bottom:16px">
-        <div class="field">
-          <label class="field-label">Hourly rate (£)</label>
-          <input id="hourlyRate" type="number" step="0.50" min="0" placeholder="12.50">
-          <div class="field-hint">Rate per staff member per paid hour</div>
-        </div>
-        <div class="field">
-          <label class="field-label">Contingency hours (per event)</label>
-          <input id="contingencyHours" type="number" step="0.5" min="0" placeholder="1">
-          <div class="field-hint">Added to every event regardless of resource type</div>
-        </div>
+        <div class="field"><label class="field-label">Hourly rate (£)</label><input id="hourlyRate" type="number" step="0.50" min="0" placeholder="12.50"><div class="field-hint">Rate per staff member per paid hour</div></div>
+        <div class="field"><label class="field-label">Contingency hours (per event)</label><input id="contingencyHours" type="number" step="0.5" min="0" placeholder="1"><div class="field-hint">Added to every event regardless of resource type</div></div>
       </div>
       <div class="field-group-3">
-        <div class="field">
-          <label class="field-label">Day Van setup (hours)</label>
-          <input id="setup_DayVan" type="number" step="0.5" min="0" placeholder="1">
-          <div class="field-hint">Resources starting "Day Van"</div>
-        </div>
-        <div class="field">
-          <label class="field-label">Trailer setup (hours)</label>
-          <input id="setup_Trailer" type="number" step="0.5" min="0" placeholder="4">
-          <div class="field-hint">Resources starting "Trailer"</div>
-        </div>
-        <div class="field">
-          <label class="field-label">POD setup (hours)</label>
-          <input id="setup_POD" type="number" step="0.5" min="0" placeholder="4">
-          <div class="field-hint">Resources starting "POD"</div>
-        </div>
+        <div class="field"><label class="field-label">Day Van setup (hours)</label><input id="setup_DayVan" type="number" step="0.5" min="0" placeholder="1"><div class="field-hint">Resources starting "Day Van"</div></div>
+        <div class="field"><label class="field-label">Trailer setup (hours)</label><input id="setup_Trailer" type="number" step="0.5" min="0" placeholder="4"><div class="field-hint">Resources starting "Trailer"</div></div>
+        <div class="field"><label class="field-label">POD setup (hours)</label><input id="setup_POD" type="number" step="0.5" min="0" placeholder="4"><div class="field-hint">Resources starting "POD"</div></div>
       </div>
     </div>
-
     <div class="card">
       <div class="card-title">Accommodation & Subsistence</div>
       <div class="card-desc">Per staff per night/day.</div>
       <div class="field-group">
-        <div class="field">
-          <label class="field-label">Hotel nightly cost (£)</label>
-          <input id="hotelNightlyCost" type="number" step="5" min="0" placeholder="80">
-        </div>
-        <div class="field">
-          <label class="field-label">Subsistence daily rate (£)</label>
-          <input id="subsistenceDailyRate" type="number" step="1" min="0" placeholder="5">
-          <div class="field-hint">HMRC benchmark: £5/day</div>
-        </div>
+        <div class="field"><label class="field-label">Hotel nightly cost (£)</label><input id="hotelNightlyCost" type="number" step="5" min="0" placeholder="80"></div>
+        <div class="field"><label class="field-label">Subsistence daily rate (£)</label><input id="subsistenceDailyRate" type="number" step="1" min="0" placeholder="5"><div class="field-hint">HMRC benchmark: £5/day</div></div>
       </div>
     </div>
-
     <div class="card">
       <div class="card-title">Employment Status</div>
       <div class="card-desc">Currently all drivers are treated as self-employed. Enable PAYE to add employer on-costs to wage calculations.</div>
       <div class="toggle-row">
-        <div class="toggle-label-col">
-          <strong>PAYE mode</strong>
-          <span>Applies on-cost multiplier to all wage calculations globally</span>
-        </div>
+        <div class="toggle-label-col"><strong>PAYE mode</strong><span>Applies on-cost multiplier to all wage calculations globally</span></div>
         <label class="toggle"><input type="checkbox" id="payeMode"><span class="slider"></span></label>
       </div>
       <div style="margin-top:16px">
-        <div class="field">
-          <label class="field-label">PAYE on-cost multiplier</label>
-          <input id="payeOnCostMultiplier" type="number" step="0.01" min="1" placeholder="1.258">
-          <div class="field-hint">Default 1.258 = employer NI 13.8% + holiday pay 12.07%. Only applied when PAYE mode is on.</div>
-        </div>
+        <div class="field"><label class="field-label">PAYE on-cost multiplier</label><input id="payeOnCostMultiplier" type="number" step="0.01" min="1" placeholder="1.258"><div class="field-hint">Default 1.258 = employer NI 13.8% + holiday pay 12.07%. Only applied when PAYE mode is on.</div></div>
       </div>
     </div>
-
     <div class="btn-row">
       <button class="btn-save" id="btn-save" onclick="saveSettings()">Save Settings</button>
       <button class="btn-reset" onclick="resetDefaults()">Reset to Defaults</button>
@@ -2046,83 +1721,13 @@ input:checked+.slider::before{transform:translateX(20px)}
   </div>
 </div>
 <script>
-const DEFAULTS = {
-  basePostcode:'GL10 3RF', hourlyRate:12.50, mileageRatePerMile:0.45,
-  hotelThresholdMiles:50, hotelNightlyCost:80, subsistenceDailyRate:5,
-  drivingSpeedMph:40, setupHours:{'Day Van':1,'Trailer':4,'POD':4},
-  contingencyHours:1, payeMode:false, payeOnCostMultiplier:1.258
-};
-
-function populate(s){
-  document.getElementById('basePostcode').value           = s.basePostcode        || DEFAULTS.basePostcode;
-  document.getElementById('hourlyRate').value             = s.hourlyRate          ?? DEFAULTS.hourlyRate;
-  document.getElementById('mileageRatePerMile').value     = s.mileageRatePerMile  ?? DEFAULTS.mileageRatePerMile;
-  document.getElementById('hotelThresholdMiles').value    = s.hotelThresholdMiles ?? DEFAULTS.hotelThresholdMiles;
-  document.getElementById('hotelNightlyCost').value       = s.hotelNightlyCost    ?? DEFAULTS.hotelNightlyCost;
-  document.getElementById('subsistenceDailyRate').value   = s.subsistenceDailyRate ?? DEFAULTS.subsistenceDailyRate;
-  document.getElementById('drivingSpeedMph').value        = s.drivingSpeedMph     ?? DEFAULTS.drivingSpeedMph;
-  document.getElementById('contingencyHours').value       = s.contingencyHours    ?? DEFAULTS.contingencyHours;
-  document.getElementById('payeOnCostMultiplier').value   = s.payeOnCostMultiplier ?? DEFAULTS.payeOnCostMultiplier;
-  document.getElementById('payeMode').checked             = !!s.payeMode;
-  const sh = s.setupHours || DEFAULTS.setupHours;
-  document.getElementById('setup_DayVan').value  = sh['Day Van'] ?? 1;
-  document.getElementById('setup_Trailer').value = sh['Trailer'] ?? 4;
-  document.getElementById('setup_POD').value     = sh['POD']     ?? 4;
-}
-
-function gather(){
-  return {
-    basePostcode:         document.getElementById('basePostcode').value.trim(),
-    hourlyRate:           parseFloat(document.getElementById('hourlyRate').value),
-    mileageRatePerMile:   parseFloat(document.getElementById('mileageRatePerMile').value),
-    hotelThresholdMiles:  parseFloat(document.getElementById('hotelThresholdMiles').value),
-    hotelNightlyCost:     parseFloat(document.getElementById('hotelNightlyCost').value),
-    subsistenceDailyRate: parseFloat(document.getElementById('subsistenceDailyRate').value),
-    drivingSpeedMph:      parseFloat(document.getElementById('drivingSpeedMph').value),
-    contingencyHours:     parseFloat(document.getElementById('contingencyHours').value),
-    payeOnCostMultiplier: parseFloat(document.getElementById('payeOnCostMultiplier').value),
-    payeMode:             document.getElementById('payeMode').checked,
-    setupHours: {
-      'Day Van':  parseFloat(document.getElementById('setup_DayVan').value),
-      'Trailer':  parseFloat(document.getElementById('setup_Trailer').value),
-      'POD':      parseFloat(document.getElementById('setup_POD').value),
-    },
-  };
-}
-
-function showStatus(msg, ok){
-  const el = document.getElementById('status-msg');
-  el.textContent = msg; el.className = 'status-msg ' + (ok?'ok':'err'); el.style.display='block';
-  if(ok) setTimeout(()=>{ el.style.display='none'; }, 3000);
-}
-
-async function saveSettings(){
-  const btn = document.getElementById('btn-save');
-  btn.disabled = true; btn.textContent = 'Saving…';
-  try{
-    const res = await fetch('/api/settings',{ method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(gather()) });
-    const data = await res.json();
-    if(data.ok){ showStatus('Saved \u2014 forecast will use new values on next load', true); }
-    else { showStatus('Save failed \u2014 check worker logs', false); }
-  } catch(e){ showStatus('Error: '+e.message, false); }
-  btn.disabled = false; btn.textContent = 'Save Settings';
-}
-
-function resetDefaults(){ populate(DEFAULTS); }
-
-async function init(){
-  try{
-    const res = await fetch('/api/settings');
-    const data = await res.json();
-    document.getElementById('loading-msg').style.display='none';
-    document.getElementById('settings-form').style.display='block';
-    populate(data);
-  } catch(e){
-    document.getElementById('loading-msg').textContent='Error loading settings: '+e.message;
-    document.getElementById('loading-msg').style.color='var(--red)';
-    document.getElementById('loading-msg').style.animation='none';
-  }
-}
+const DEFAULTS={basePostcode:'GL10 3RF',hourlyRate:12.50,mileageRatePerMile:0.45,hotelThresholdMiles:50,hotelNightlyCost:80,subsistenceDailyRate:5,drivingSpeedMph:40,setupHours:{'Day Van':1,'Trailer':4,'POD':4},contingencyHours:1,payeMode:false,payeOnCostMultiplier:1.258};
+function populate(s){document.getElementById('basePostcode').value=s.basePostcode||DEFAULTS.basePostcode;document.getElementById('hourlyRate').value=s.hourlyRate??DEFAULTS.hourlyRate;document.getElementById('mileageRatePerMile').value=s.mileageRatePerMile??DEFAULTS.mileageRatePerMile;document.getElementById('hotelThresholdMiles').value=s.hotelThresholdMiles??DEFAULTS.hotelThresholdMiles;document.getElementById('hotelNightlyCost').value=s.hotelNightlyCost??DEFAULTS.hotelNightlyCost;document.getElementById('subsistenceDailyRate').value=s.subsistenceDailyRate??DEFAULTS.subsistenceDailyRate;document.getElementById('drivingSpeedMph').value=s.drivingSpeedMph??DEFAULTS.drivingSpeedMph;document.getElementById('contingencyHours').value=s.contingencyHours??DEFAULTS.contingencyHours;document.getElementById('payeOnCostMultiplier').value=s.payeOnCostMultiplier??DEFAULTS.payeOnCostMultiplier;document.getElementById('payeMode').checked=!!s.payeMode;const sh=s.setupHours||DEFAULTS.setupHours;document.getElementById('setup_DayVan').value=sh['Day Van']??1;document.getElementById('setup_Trailer').value=sh['Trailer']??4;document.getElementById('setup_POD').value=sh['POD']??4;}
+function gather(){return{basePostcode:document.getElementById('basePostcode').value.trim(),hourlyRate:parseFloat(document.getElementById('hourlyRate').value),mileageRatePerMile:parseFloat(document.getElementById('mileageRatePerMile').value),hotelThresholdMiles:parseFloat(document.getElementById('hotelThresholdMiles').value),hotelNightlyCost:parseFloat(document.getElementById('hotelNightlyCost').value),subsistenceDailyRate:parseFloat(document.getElementById('subsistenceDailyRate').value),drivingSpeedMph:parseFloat(document.getElementById('drivingSpeedMph').value),contingencyHours:parseFloat(document.getElementById('contingencyHours').value),payeOnCostMultiplier:parseFloat(document.getElementById('payeOnCostMultiplier').value),payeMode:document.getElementById('payeMode').checked,setupHours:{'Day Van':parseFloat(document.getElementById('setup_DayVan').value),'Trailer':parseFloat(document.getElementById('setup_Trailer').value),'POD':parseFloat(document.getElementById('setup_POD').value)}};}
+function showStatus(msg,ok){const el=document.getElementById('status-msg');el.textContent=msg;el.className='status-msg '+(ok?'ok':'err');el.style.display='block';if(ok)setTimeout(()=>{el.style.display='none';},3000);}
+async function saveSettings(){const btn=document.getElementById('btn-save');btn.disabled=true;btn.textContent='Saving…';try{const res=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(gather())});const data=await res.json();if(data.ok){showStatus('Saved \u2014 forecast will use new values on next load',true);}else{showStatus('Save failed \u2014 check worker logs',false);}}catch(e){showStatus('Error: '+e.message,false);}btn.disabled=false;btn.textContent='Save Settings';}
+function resetDefaults(){populate(DEFAULTS);}
+async function init(){try{const res=await fetch('/api/settings');const data=await res.json();document.getElementById('loading-msg').style.display='none';document.getElementById('settings-form').style.display='block';populate(data);}catch(e){document.getElementById('loading-msg').textContent='Error loading settings: '+e.message;document.getElementById('loading-msg').style.color='var(--red)';document.getElementById('loading-msg').style.animation='none';}}
 init();
 </script>
 </body></html>
