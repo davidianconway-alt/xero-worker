@@ -563,6 +563,7 @@ export default {
     if (path === "/api/pipeline")          return handlePipeline(env);
     if (path === "/api/sp-debug")          return handleSpDebug(env);
     if (path === "/api/xero/invoices")     return handleXeroInvoices(env);
+    if (path === "/api/xero/accounts-used") return handleXeroAccountsUsed(env);
     if (path === "/api/settings") {
       if (method === "GET")  return handleSettingsGet(env);
       if (method === "POST") return handleSettingsPost(request, env);
@@ -1147,6 +1148,101 @@ async function handleXeroInvoices(env: Env): Promise<Response> {
 
   return Response.json(
     { year, count: invoices.length, invoices },
+    { headers: { "Access-Control-Allow-Origin": "*" } }
+  );
+}
+
+// ─── NEW: Discover Chart of Accounts + actual usage this year ─────────────────
+// Pulls the full Chart of Accounts (code, name, type, class) and cross-references
+// against every Bill (ACCPAY) and BankTransaction this year to show which codes
+// are genuinely in use, with transaction counts and totals. Used as a one-off
+// discovery step before building out full outgoings tracking.
+async function handleXeroAccountsUsed(env: Env): Promise<Response> {
+  let tokens: XeroTokens;
+  try { tokens = await getValidTokens(env); } catch (e: any) { return new Response(e.message, { status: 401 }); }
+  const h = {
+    Authorization: `Bearer ${tokens.access_token}`,
+    "Xero-tenant-id": tokens.tenant_id,
+    Accept: "application/json",
+  };
+
+  const year     = new Date().getFullYear();
+  const fromDate = `${year}-01-01`;
+  const toDate   = `${year}-12-31`;
+
+  // Fetch Chart of Accounts, Bills (ACCPAY), and BankTransactions for the year in parallel
+  const [acctRes, billRes, txRes] = await Promise.all([
+    fetch(`${XERO_API_BASE}/Accounts`, { headers: h }),
+    fetch(
+      `${XERO_API_BASE}/Invoices?where=${encodeURIComponent(
+        `Type=="ACCPAY"&&DateString>="${fromDate}"&&DateString<="${toDate}"`
+      )}&order=DateString+ASC`,
+      { headers: h }
+    ),
+    fetch(
+      `${XERO_API_BASE}/BankTransactions?where=${encodeURIComponent(
+        `DateString>="${fromDate}"&&DateString<="${toDate}"`
+      )}`,
+      { headers: h }
+    ),
+  ]);
+
+  if (!acctRes.ok) return new Response(await acctRes.text(), { status: acctRes.status, headers: { "Access-Control-Allow-Origin": "*" } });
+  if (!billRes.ok) return new Response(await billRes.text(), { status: billRes.status, headers: { "Access-Control-Allow-Origin": "*" } });
+  if (!txRes.ok)   return new Response(await txRes.text(),   { status: txRes.status,   headers: { "Access-Control-Allow-Origin": "*" } });
+
+  const acctData: any = await acctRes.json();
+  const billData: any = await billRes.json();
+  const txData: any   = await txRes.json();
+
+  // Build code → name/type lookup from Chart of Accounts
+  const acctLookup: Record<string, { name: string; type: string; class: string }> = {};
+  for (const a of acctData.Accounts || []) {
+    if (a.Code) {
+      acctLookup[a.Code] = { name: a.Name || "", type: a.Type || "", class: a.Class || "" };
+    }
+  }
+
+  // Aggregate usage by account code
+  interface CodeUsage { code: string; name: string; type: string; class: string; source: string; count: number; total: number; }
+  const usage: Record<string, CodeUsage> = {};
+
+  function addUsage(code: string, source: string, amount: number) {
+    if (!code) code = "(no code)";
+    const key = code + "__" + source;
+    if (!usage[key]) {
+      const info = acctLookup[code] || { name: "(unknown)", type: "", class: "" };
+      usage[key] = { code, name: info.name, type: info.type, class: info.class, source, count: 0, total: 0 };
+    }
+    usage[key].count += 1;
+    usage[key].total += amount;
+  }
+
+  // Bills — each Bill can have multiple line items, each potentially on a different account code
+  for (const bill of billData.Invoices || []) {
+    for (const line of bill.LineItems || []) {
+      addUsage(line.AccountCode || "", "Bill", line.LineAmount || 0);
+    }
+  }
+
+  // Bank transactions — same, line-item level account codes
+  for (const tx of txData.BankTransactions || []) {
+    if (tx.Type !== "SPEND" && tx.Type !== "SPEND-OVERPAYMENT" &&
+        tx.Type !== "RECEIVE" && tx.Type !== "RECEIVE-OVERPAYMENT") continue;
+    for (const line of tx.LineItems || []) {
+      addUsage(line.AccountCode || "", tx.Type, line.LineAmount || 0);
+    }
+  }
+
+  const usageList = Object.values(usage).sort((a, b) => b.total - a.total);
+
+  return Response.json(
+    {
+      year,
+      totalAccountsInChart: Object.keys(acctLookup).length,
+      codesWithActivity: usageList.length,
+      usage: usageList,
+    },
     { headers: { "Access-Control-Allow-Origin": "*" } }
   );
 }
