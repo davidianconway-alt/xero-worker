@@ -1252,9 +1252,108 @@ async function handleXeroOutgoings(env: Env): Promise<Response> {
 
   const contactList = Object.values(byContact).sort((a, b) => b.grandTotal - a.grandTotal);
 
+  // Monthly breakdown — bills by Date, bank tx by Date. Gives cadence visibility
+  // for fixed-cost forecasting (e.g. "pension goes out every month around the 28th").
+  interface MonthUsage {
+    month: string; // YYYY-MM
+    billTotal: number; billCount: number;
+    spendTotal: number; spendCount: number;
+    receiveTotal: number; receiveCount: number;
+    netOutgoing: number;
+  }
+  const byMonth: Record<string, MonthUsage> = {};
+
+  function ensureMonth(month: string): MonthUsage {
+    if (!byMonth[month]) {
+      byMonth[month] = {
+        month, billTotal: 0, billCount: 0,
+        spendTotal: 0, spendCount: 0,
+        receiveTotal: 0, receiveCount: 0,
+        netOutgoing: 0,
+      };
+    }
+    return byMonth[month];
+  }
+
+  for (const bill of billsThisYear) {
+    const d = parseXeroDateObj(bill.Date);
+    if (!d) continue;
+    const month = d.toISOString().substring(0, 7);
+    const m = ensureMonth(month);
+    m.billTotal += bill.Total || 0;
+    m.billCount += 1;
+  }
+
+  for (const tx of txThisYear) {
+    const d = parseXeroDateObj(tx.Date);
+    if (!d) continue;
+    const month = d.toISOString().substring(0, 7);
+    const m = ensureMonth(month);
+    if (tx.Type === "SPEND" || tx.Type === "SPEND-OVERPAYMENT") {
+      m.spendTotal += tx.Total || 0;
+      m.spendCount += 1;
+    } else if (tx.Type === "RECEIVE" || tx.Type === "RECEIVE-OVERPAYMENT") {
+      m.receiveTotal += tx.Total || 0;
+      m.receiveCount += 1;
+    }
+  }
+
+  const monthList = Object.values(byMonth)
+    .map((m) => ({ ...m, netOutgoing: m.billTotal + m.spendTotal - m.receiveTotal }))
+    .sort((a, b) => a.month.localeCompare(b.month));
+
   const totalBillSpend    = billsThisYear.reduce((a, b) => a + (b.Total || 0), 0);
   const totalBankSpend    = txThisYear.filter(t => t.Type === "SPEND" || t.Type === "SPEND-OVERPAYMENT").reduce((a, t) => a + (t.Total || 0), 0);
   const totalBankReceive  = txThisYear.filter(t => t.Type === "RECEIVE" || t.Type === "RECEIVE-OVERPAYMENT").reduce((a, t) => a + (t.Total || 0), 0);
+
+  // Flat transaction-level export — one row per bill and per bank transaction.
+  // Lets the sheet build its own category × month pivots using SUMIFS against
+  // whatever Category mapping has been applied to each contact.
+  interface OutgoingTxn {
+    date: string;      // YYYY-MM-DD
+    month: string;      // YYYY-MM
+    contact: string;
+    type: string;        // "Bill" | "SPEND" | "SPEND-OVERPAYMENT" | "RECEIVE" | "RECEIVE-OVERPAYMENT"
+    reference: string;
+    invoiceNumber: string;
+    amount: number;
+    status: string;
+  }
+  const transactions: OutgoingTxn[] = [];
+
+  for (const bill of billsThisYear) {
+    const d = parseXeroDateObj(bill.Date);
+    if (!d) continue;
+    transactions.push({
+      date: toISO(d),
+      month: d.toISOString().substring(0, 7),
+      contact: bill.Contact?.Name || "(no contact)",
+      type: "Bill",
+      reference: bill.Reference || "",
+      invoiceNumber: bill.InvoiceNumber || "",
+      amount: bill.Total || 0,
+      status: bill.Status || "",
+    });
+  }
+
+  for (const tx of txThisYear) {
+    if (tx.Type !== "SPEND" && tx.Type !== "SPEND-OVERPAYMENT" &&
+        tx.Type !== "RECEIVE" && tx.Type !== "RECEIVE-OVERPAYMENT") continue;
+    const d = parseXeroDateObj(tx.Date);
+    if (!d) continue;
+    transactions.push({
+      date: toISO(d),
+      month: d.toISOString().substring(0, 7),
+      contact: tx.Contact?.Name || "(no contact)",
+      type: tx.Type,
+      reference: tx.Reference || "",
+      invoiceNumber: "",
+      amount: tx.Total || 0,
+      status: tx.Status || "",
+    });
+  }
+
+  transactions.sort((a, b) => a.date.localeCompare(b.date));
 
   return Response.json(
     {
@@ -1266,6 +1365,9 @@ async function handleXeroOutgoings(env: Env): Promise<Response> {
       totalBankReceive,
       contactCount: contactList.length,
       byContact: contactList,
+      byMonth: monthList,
+      transactionCount: transactions.length,
+      transactions,
     },
     { headers: { "Access-Control-Allow-Origin": "*" } }
   );
