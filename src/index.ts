@@ -563,7 +563,7 @@ export default {
     if (path === "/api/pipeline")          return handlePipeline(env);
     if (path === "/api/sp-debug")          return handleSpDebug(env);
     if (path === "/api/xero/invoices")     return handleXeroInvoices(env);
-    if (path === "/api/xero/accounts-used") return handleXeroAccountsUsed(env);
+    if (path === "/api/xero/outgoings")    return handleXeroOutgoings(env);
     if (path === "/api/settings") {
       if (method === "GET")  return handleSettingsGet(env);
       if (method === "POST") return handleSettingsPost(request, env);
@@ -1152,12 +1152,14 @@ async function handleXeroInvoices(env: Env): Promise<Response> {
   );
 }
 
-// ─── NEW: Discover Chart of Accounts + actual usage this year ─────────────────
-// Pulls the full Chart of Accounts (code, name, type, class) and cross-references
-// against every Bill (ACCPAY) and BankTransaction this year to show which codes
-// are genuinely in use, with transaction counts and totals. Used as a one-off
-// discovery step before building out full outgoings tracking.
-async function handleXeroAccountsUsed(env: Env): Promise<Response> {
+// ─── NEW: Outgoings by contact — Bills (ACCPAY) + bank SPEND this year ────────
+// Xero's list endpoints don't return LineItems (so account-code grouping isn't
+// available without fetching every record individually — too slow/rate-limit
+// risky for hundreds of records). Groups by Contact name instead, which is
+// already present on the list response. Also: the `where` date filter on
+// Invoices was unreliable (returned records from outside the requested range),
+// so date filtering happens client-side here using parsed dates instead.
+async function handleXeroOutgoings(env: Env): Promise<Response> {
   let tokens: XeroTokens;
   try { tokens = await getValidTokens(env); } catch (e: any) { return new Response(e.message, { status: 401 }); }
   const h = {
@@ -1166,82 +1168,104 @@ async function handleXeroAccountsUsed(env: Env): Promise<Response> {
     Accept: "application/json",
   };
 
-  const year     = new Date().getFullYear();
-  const fromDate = `${year}-01-01`;
-  const toDate   = `${year}-12-31`;
+  const year = new Date().getFullYear();
+  const yearStart = new Date(year, 0, 1);
+  const yearEnd   = new Date(year, 11, 31, 23, 59, 59);
 
-  // Fetch Chart of Accounts, Bills (ACCPAY), and BankTransactions for the year in parallel
-  const [acctRes, billRes, txRes] = await Promise.all([
-    fetch(`${XERO_API_BASE}/Accounts`, { headers: h }),
-    fetch(
-      `${XERO_API_BASE}/Invoices?where=${encodeURIComponent(
-        `Type=="ACCPAY"&&DateString>="${fromDate}"&&DateString<="${toDate}"`
-      )}&order=DateString+ASC`,
-      { headers: h }
-    ),
-    fetch(
-      `${XERO_API_BASE}/BankTransactions?where=${encodeURIComponent(
-        `DateString>="${fromDate}"&&DateString<="${toDate}"`
-      )}`,
-      { headers: h }
-    ),
+  // Fetch ALL ACCPAY bills and ALL bank transactions — no server-side date
+  // filter (unreliable), filter client-side instead. Xero paginates at 100
+  // records per page for these endpoints.
+  async function fetchAllPages(endpoint: string): Promise<any[]> {
+    let all: any[] = [];
+    let page = 1;
+    while (true) {
+      const res = await fetch(`${XERO_API_BASE}${endpoint}&page=${page}`, { headers: h });
+      if (!res.ok) break;
+      const data: any = await res.json();
+      const key = endpoint.includes("Invoices") ? "Invoices" : "BankTransactions";
+      const records = data[key] || [];
+      all = all.concat(records);
+      if (records.length < 100) break; // last page
+      page++;
+      if (page > 20) break; // safety cap — 2000 records
+    }
+    return all;
+  }
+
+  const [allBills, allTx] = await Promise.all([
+    fetchAllPages(`/Invoices?where=${encodeURIComponent('Type=="ACCPAY"')}&order=Date+DESC`),
+    fetchAllPages(`/BankTransactions?order=Date+DESC`),
   ]);
 
-  if (!acctRes.ok) return new Response(await acctRes.text(), { status: acctRes.status, headers: { "Access-Control-Allow-Origin": "*" } });
-  if (!billRes.ok) return new Response(await billRes.text(), { status: billRes.status, headers: { "Access-Control-Allow-Origin": "*" } });
-  if (!txRes.ok)   return new Response(await txRes.text(),   { status: txRes.status,   headers: { "Access-Control-Allow-Origin": "*" } });
+  // Filter to this year client-side using the actual parsed Date field
+  const billsThisYear = allBills.filter((b) => {
+    const d = parseXeroDateObj(b.Date);
+    return d && d >= yearStart && d <= yearEnd;
+  });
+  const txThisYear = allTx.filter((t) => {
+    const d = parseXeroDateObj(t.Date);
+    return d && d >= yearStart && d <= yearEnd;
+  });
 
-  const acctData: any = await acctRes.json();
-  const billData: any = await billRes.json();
-  const txData: any   = await txRes.json();
+  // Aggregate by contact name
+  interface ContactUsage {
+    contact: string;
+    billCount: number; billTotal: number;
+    spendCount: number; spendTotal: number;
+    receiveCount: number; receiveTotal: number;
+    grandTotal: number; // bills + spend, as outgoings; receive tracked separately
+  }
+  const byContact: Record<string, ContactUsage> = {};
 
-  // Build code → name/type lookup from Chart of Accounts
-  const acctLookup: Record<string, { name: string; type: string; class: string }> = {};
-  for (const a of acctData.Accounts || []) {
-    if (a.Code) {
-      acctLookup[a.Code] = { name: a.Name || "", type: a.Type || "", class: a.Class || "" };
+  function ensure(contact: string): ContactUsage {
+    if (!byContact[contact]) {
+      byContact[contact] = {
+        contact, billCount: 0, billTotal: 0,
+        spendCount: 0, spendTotal: 0,
+        receiveCount: 0, receiveTotal: 0,
+        grandTotal: 0,
+      };
+    }
+    return byContact[contact];
+  }
+
+  for (const bill of billsThisYear) {
+    const contact = bill.Contact?.Name || "(no contact)";
+    const c = ensure(contact);
+    c.billCount += 1;
+    c.billTotal += bill.Total || 0;
+    c.grandTotal += bill.Total || 0;
+  }
+
+  for (const tx of txThisYear) {
+    const contact = tx.Contact?.Name || "(no contact)";
+    const c = ensure(contact);
+    if (tx.Type === "SPEND" || tx.Type === "SPEND-OVERPAYMENT") {
+      c.spendCount += 1;
+      c.spendTotal += tx.Total || 0;
+      c.grandTotal += tx.Total || 0;
+    } else if (tx.Type === "RECEIVE" || tx.Type === "RECEIVE-OVERPAYMENT") {
+      c.receiveCount += 1;
+      c.receiveTotal += tx.Total || 0;
     }
   }
 
-  // Aggregate usage by account code
-  interface CodeUsage { code: string; name: string; type: string; class: string; source: string; count: number; total: number; }
-  const usage: Record<string, CodeUsage> = {};
+  const contactList = Object.values(byContact).sort((a, b) => b.grandTotal - a.grandTotal);
 
-  function addUsage(code: string, source: string, amount: number) {
-    if (!code) code = "(no code)";
-    const key = code + "__" + source;
-    if (!usage[key]) {
-      const info = acctLookup[code] || { name: "(unknown)", type: "", class: "" };
-      usage[key] = { code, name: info.name, type: info.type, class: info.class, source, count: 0, total: 0 };
-    }
-    usage[key].count += 1;
-    usage[key].total += amount;
-  }
-
-  // Bills — each Bill can have multiple line items, each potentially on a different account code
-  for (const bill of billData.Invoices || []) {
-    for (const line of bill.LineItems || []) {
-      addUsage(line.AccountCode || "", "Bill", line.LineAmount || 0);
-    }
-  }
-
-  // Bank transactions — same, line-item level account codes
-  for (const tx of txData.BankTransactions || []) {
-    if (tx.Type !== "SPEND" && tx.Type !== "SPEND-OVERPAYMENT" &&
-        tx.Type !== "RECEIVE" && tx.Type !== "RECEIVE-OVERPAYMENT") continue;
-    for (const line of tx.LineItems || []) {
-      addUsage(line.AccountCode || "", tx.Type, line.LineAmount || 0);
-    }
-  }
-
-  const usageList = Object.values(usage).sort((a, b) => b.total - a.total);
+  const totalBillSpend    = billsThisYear.reduce((a, b) => a + (b.Total || 0), 0);
+  const totalBankSpend    = txThisYear.filter(t => t.Type === "SPEND" || t.Type === "SPEND-OVERPAYMENT").reduce((a, t) => a + (t.Total || 0), 0);
+  const totalBankReceive  = txThisYear.filter(t => t.Type === "RECEIVE" || t.Type === "RECEIVE-OVERPAYMENT").reduce((a, t) => a + (t.Total || 0), 0);
 
   return Response.json(
     {
       year,
-      totalAccountsInChart: Object.keys(acctLookup).length,
-      codesWithActivity: usageList.length,
-      usage: usageList,
+      billCount: billsThisYear.length,
+      txCount: txThisYear.length,
+      totalBillSpend,
+      totalBankSpend,
+      totalBankReceive,
+      contactCount: contactList.length,
+      byContact: contactList,
     },
     { headers: { "Access-Control-Allow-Origin": "*" } }
   );
