@@ -88,13 +88,6 @@ const XERO_API_BASE  = "https://api.xero.com/api.xro/2.0";
 const SP_API_BASE    = "https://api.sonderplan.com/v2";
 const MOBILOO_PARENT_ID = 23814;
 
-// ─── Version history ──────────────────────────────────────────────────────────
-// v1.0  Initial deploy — Xero OAuth, dashboard, forecast, settings
-// v1.1  Per-resource rows, op hours × days, bulk geocode, price on first row only
-// v1.2  Postcode extraction fix, outcode fallback, driving hours divide-by-zero fix, PAID/invoiced statuses
-// v1.3  Add /api/xero/invoices endpoint (ACCREC, AUTHORISED+PAID, current year, net ex VAT)
-// ─────────────────────────────────────────────────────────────────────────────
-
 // ─── In-memory geocode cache ──────────────────────────────────────────────────
 const geocodeCache = new Map<string, { lat: number; lng: number } | null>();
 
@@ -1139,10 +1132,11 @@ async function handleXeroInvoices(env: Env): Promise<Response> {
   const data: any = await res.json();
   const invoices = (data.Invoices || []).map((inv: any) => ({
     invoiceNumber: inv.InvoiceNumber || "",
-    reference:     inv.Reference     || "",
+    reference:     inv.Reference || "",
     contact:       inv.Contact?.Name || "",
     date:          parseXeroDateFull(inv.Date),
     dueDate:       parseXeroDateFull(inv.DueDate),
+    paidDate:      inv.FullyPaidOnDate ? parseXeroDateFull(inv.FullyPaidOnDate) : "",
     status:        inv.Status || "",
     subTotal:      inv.SubTotal   || 0,   // net of VAT
     totalTax:      inv.TotalTax   || 0,
