@@ -26,6 +26,7 @@ interface CostSettings {
   contingencyHours: number;
   payeMode: boolean;
   payeOnCostMultiplier: number;
+  driverPaymentDaysAfterEvent: number;  // days after event end before driver pay leaves the bank
 }
 
 interface EventCosts {
@@ -69,17 +70,18 @@ interface PipelineItem {
 }
 
 const DEFAULT_COST_SETTINGS: CostSettings = {
-  basePostcode:          "GL10 3RF",
-  hourlyRate:            12.50,
-  mileageRatePerMile:    0.45,
-  hotelThresholdMiles:   50,
-  hotelNightlyCost:      80,
-  subsistenceDailyRate:  5,
-  drivingSpeedMph:       40,
-  setupHours:            { "Day Van": 1, "Trailer": 4, "POD": 4 },
-  contingencyHours:      1,
-  payeMode:              false,
-  payeOnCostMultiplier:  1.258,
+  basePostcode:                 "GL10 3RF",
+  hourlyRate:                   12.50,
+  mileageRatePerMile:           0.45,
+  hotelThresholdMiles:          50,
+  hotelNightlyCost:             80,
+  subsistenceDailyRate:         5,
+  drivingSpeedMph:              40,
+  setupHours:                   { "Day Van": 1, "Trailer": 4, "POD": 4 },
+  contingencyHours:             1,
+  payeMode:                     false,
+  payeOnCostMultiplier:         1.258,
+  driverPaymentDaysAfterEvent:  14,  // drivers paid 14 days after event end by default
 };
 
 const XERO_AUTH_URL  = "https://login.xero.com/identity/connect/authorize";
@@ -1912,6 +1914,9 @@ input:checked+.slider::before{transform:translateX(20px)}
         <div class="field"><label class="field-label">Hourly rate (£)</label><input id="hourlyRate" type="number" step="0.50" min="0" placeholder="12.50"><div class="field-hint">Rate per staff member per paid hour</div></div>
         <div class="field"><label class="field-label">Contingency hours (per event)</label><input id="contingencyHours" type="number" step="0.5" min="0" placeholder="1"><div class="field-hint">Added to every event regardless of resource type</div></div>
       </div>
+      <div class="field-group" style="margin-bottom:16px">
+        <div class="field"><label class="field-label">Driver payment terms (days after event end)</label><input id="driverPaymentDaysAfterEvent" type="number" step="1" min="0" placeholder="14"><div class="field-hint">Days after event end date before driver pay leaves the bank — used in cash flow timing</div></div>
+      </div>
       <div class="field-group-3">
         <div class="field"><label class="field-label">Day Van setup (hours)</label><input id="setup_DayVan" type="number" step="0.5" min="0" placeholder="1"><div class="field-hint">Resources starting "Day Van"</div></div>
         <div class="field"><label class="field-label">Trailer setup (hours)</label><input id="setup_Trailer" type="number" step="0.5" min="0" placeholder="4"><div class="field-hint">Resources starting "Trailer"</div></div>
@@ -1945,9 +1950,9 @@ input:checked+.slider::before{transform:translateX(20px)}
   </div>
 </div>
 <script>
-const DEFAULTS={basePostcode:'GL10 3RF',hourlyRate:12.50,mileageRatePerMile:0.45,hotelThresholdMiles:50,hotelNightlyCost:80,subsistenceDailyRate:5,drivingSpeedMph:40,setupHours:{'Day Van':1,'Trailer':4,'POD':4},contingencyHours:1,payeMode:false,payeOnCostMultiplier:1.258};
-function populate(s){document.getElementById('basePostcode').value=s.basePostcode||DEFAULTS.basePostcode;document.getElementById('hourlyRate').value=s.hourlyRate??DEFAULTS.hourlyRate;document.getElementById('mileageRatePerMile').value=s.mileageRatePerMile??DEFAULTS.mileageRatePerMile;document.getElementById('hotelThresholdMiles').value=s.hotelThresholdMiles??DEFAULTS.hotelThresholdMiles;document.getElementById('hotelNightlyCost').value=s.hotelNightlyCost??DEFAULTS.hotelNightlyCost;document.getElementById('subsistenceDailyRate').value=s.subsistenceDailyRate??DEFAULTS.subsistenceDailyRate;document.getElementById('drivingSpeedMph').value=s.drivingSpeedMph??DEFAULTS.drivingSpeedMph;document.getElementById('contingencyHours').value=s.contingencyHours??DEFAULTS.contingencyHours;document.getElementById('payeOnCostMultiplier').value=s.payeOnCostMultiplier??DEFAULTS.payeOnCostMultiplier;document.getElementById('payeMode').checked=!!s.payeMode;const sh=s.setupHours||DEFAULTS.setupHours;document.getElementById('setup_DayVan').value=sh['Day Van']??1;document.getElementById('setup_Trailer').value=sh['Trailer']??4;document.getElementById('setup_POD').value=sh['POD']??4;}
-function gather(){return{basePostcode:document.getElementById('basePostcode').value.trim(),hourlyRate:parseFloat(document.getElementById('hourlyRate').value),mileageRatePerMile:parseFloat(document.getElementById('mileageRatePerMile').value),hotelThresholdMiles:parseFloat(document.getElementById('hotelThresholdMiles').value),hotelNightlyCost:parseFloat(document.getElementById('hotelNightlyCost').value),subsistenceDailyRate:parseFloat(document.getElementById('subsistenceDailyRate').value),drivingSpeedMph:parseFloat(document.getElementById('drivingSpeedMph').value),contingencyHours:parseFloat(document.getElementById('contingencyHours').value),payeOnCostMultiplier:parseFloat(document.getElementById('payeOnCostMultiplier').value),payeMode:document.getElementById('payeMode').checked,setupHours:{'Day Van':parseFloat(document.getElementById('setup_DayVan').value),'Trailer':parseFloat(document.getElementById('setup_Trailer').value),'POD':parseFloat(document.getElementById('setup_POD').value)}};}
+const DEFAULTS={basePostcode:'GL10 3RF',hourlyRate:12.50,mileageRatePerMile:0.45,hotelThresholdMiles:50,hotelNightlyCost:80,subsistenceDailyRate:5,drivingSpeedMph:40,setupHours:{'Day Van':1,'Trailer':4,'POD':4},contingencyHours:1,payeMode:false,payeOnCostMultiplier:1.258,driverPaymentDaysAfterEvent:14};
+function populate(s){document.getElementById('basePostcode').value=s.basePostcode||DEFAULTS.basePostcode;document.getElementById('hourlyRate').value=s.hourlyRate??DEFAULTS.hourlyRate;document.getElementById('mileageRatePerMile').value=s.mileageRatePerMile??DEFAULTS.mileageRatePerMile;document.getElementById('hotelThresholdMiles').value=s.hotelThresholdMiles??DEFAULTS.hotelThresholdMiles;document.getElementById('hotelNightlyCost').value=s.hotelNightlyCost??DEFAULTS.hotelNightlyCost;document.getElementById('subsistenceDailyRate').value=s.subsistenceDailyRate??DEFAULTS.subsistenceDailyRate;document.getElementById('drivingSpeedMph').value=s.drivingSpeedMph??DEFAULTS.drivingSpeedMph;document.getElementById('contingencyHours').value=s.contingencyHours??DEFAULTS.contingencyHours;document.getElementById('payeOnCostMultiplier').value=s.payeOnCostMultiplier??DEFAULTS.payeOnCostMultiplier;document.getElementById('driverPaymentDaysAfterEvent').value=s.driverPaymentDaysAfterEvent??DEFAULTS.driverPaymentDaysAfterEvent;document.getElementById('payeMode').checked=!!s.payeMode;const sh=s.setupHours||DEFAULTS.setupHours;document.getElementById('setup_DayVan').value=sh['Day Van']??1;document.getElementById('setup_Trailer').value=sh['Trailer']??4;document.getElementById('setup_POD').value=sh['POD']??4;}
+function gather(){return{basePostcode:document.getElementById('basePostcode').value.trim(),hourlyRate:parseFloat(document.getElementById('hourlyRate').value),mileageRatePerMile:parseFloat(document.getElementById('mileageRatePerMile').value),hotelThresholdMiles:parseFloat(document.getElementById('hotelThresholdMiles').value),hotelNightlyCost:parseFloat(document.getElementById('hotelNightlyCost').value),subsistenceDailyRate:parseFloat(document.getElementById('subsistenceDailyRate').value),drivingSpeedMph:parseFloat(document.getElementById('drivingSpeedMph').value),contingencyHours:parseFloat(document.getElementById('contingencyHours').value),payeOnCostMultiplier:parseFloat(document.getElementById('payeOnCostMultiplier').value),driverPaymentDaysAfterEvent:parseInt(document.getElementById('driverPaymentDaysAfterEvent').value)||14,payeMode:document.getElementById('payeMode').checked,setupHours:{'Day Van':parseFloat(document.getElementById('setup_DayVan').value),'Trailer':parseFloat(document.getElementById('setup_Trailer').value),'POD':parseFloat(document.getElementById('setup_POD').value)}};}
 function showStatus(msg,ok){const el=document.getElementById('status-msg');el.textContent=msg;el.className='status-msg '+(ok?'ok':'err');el.style.display='block';if(ok)setTimeout(()=>{el.style.display='none';},3000);}
 async function saveSettings(){const btn=document.getElementById('btn-save');btn.disabled=true;btn.textContent='Saving…';try{const res=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(gather())});const data=await res.json();if(data.ok){showStatus('Saved \u2014 forecast will use new values on next load',true);}else{showStatus('Save failed \u2014 check worker logs',false);}}catch(e){showStatus('Error: '+e.message,false);}btn.disabled=false;btn.textContent='Save Settings';}
 function resetDefaults(){populate(DEFAULTS);}
