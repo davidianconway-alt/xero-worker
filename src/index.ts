@@ -566,6 +566,7 @@ export default {
     if (path === "/api/sp-debug")          return handleSpDebug(env);
     if (path === "/api/xero/invoices")     return handleXeroInvoices(env);
     if (path === "/api/xero/outgoings")    return handleXeroOutgoings(env);
+    if (path === "/api/xero/balancesheet") return handleXeroBalanceSheet(request, env);
     if (path === "/api/settings") {
       if (method === "GET")  return handleSettingsGet(env);
       if (method === "POST") return handleSettingsPost(request, env);
@@ -1371,6 +1372,78 @@ async function handleXeroOutgoings(env: Env): Promise<Response> {
       transactionCount: transactions.length,
       transactions,
     },
+    { headers: { "Access-Control-Allow-Origin": "*" } }
+  );
+}
+
+// ─── NEW: Balance Sheet at a specific date ────────────────────────────────────
+// Used to get opening bank balance for cash flow (e.g. ?date=2025-12-31).
+// Defaults to today if no date param supplied.
+// Returns: total bank balance + breakdown by account name.
+async function handleXeroBalanceSheet(request: Request, env: Env): Promise<Response> {
+  let tokens: XeroTokens;
+  try { tokens = await getValidTokens(env); } catch (e: any) { return new Response(e.message, { status: 401 }); }
+  const h = {
+    Authorization: `Bearer ${tokens.access_token}`,
+    "Xero-tenant-id": tokens.tenant_id,
+    Accept: "application/json",
+  };
+
+  // Accept date param — default to today
+  const url  = new URL(request.url);
+  const date = url.searchParams.get("date") || new Date().toISOString().substring(0, 10);
+
+  const res = await fetch(`${XERO_API_BASE}/Reports/BalanceSheet?date=${date}`, { headers: h });
+  if (!res.ok) {
+    return new Response(await res.text(), {
+      status: res.status,
+      headers: { "Access-Control-Allow-Origin": "*" },
+    });
+  }
+
+  const data: any = await res.json();
+
+  // Walk the Balance Sheet report rows to extract bank account balances.
+  // Report structure: Rows[] → RowType=Section with Title containing "Bank" →
+  // Rows[] → RowType=Row with Cells[0]=account name, Cells[last]=balance value.
+  const accounts: { name: string; balance: number }[] = [];
+
+  function walkRows(rows: any[]): void {
+    for (const row of rows || []) {
+      if (row.RowType === "Section" && row.Title?.toLowerCase().includes("bank")) {
+        for (const r of row.Rows || []) {
+          if (r.RowType === "Row" && r.Cells?.length >= 2) {
+            const name    = r.Cells[0]?.Value || "";
+            const rawVal  = r.Cells[r.Cells.length - 1]?.Value || "0";
+            const balance = parseFloat(rawVal.replace(/[^0-9.-]/g, ""));
+            if (name && !isNaN(balance) && name !== "Bank accounts") {
+              accounts.push({ name, balance });
+            }
+          }
+        }
+      }
+      if (row.Rows) walkRows(row.Rows);
+    }
+  }
+
+  walkRows(data.Reports?.[0]?.Rows || []);
+
+  const total = accounts.reduce((sum, a) => sum + a.balance, 0);
+
+  if (accounts.length === 0) {
+    return Response.json(
+      {
+        date,
+        total: null,
+        accounts: [],
+        note: "No bank accounts found in Balance Sheet report — check accounting.reports.read scope is authorised",
+      },
+      { headers: { "Access-Control-Allow-Origin": "*" } }
+    );
+  }
+
+  return Response.json(
+    { date, total, accounts },
     { headers: { "Access-Control-Allow-Origin": "*" } }
   );
 }
