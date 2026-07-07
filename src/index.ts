@@ -286,6 +286,34 @@ function fmtGBP(n: number): string {
 }
 
 // ─── KV settings helpers ──────────────────────────────────────────────────────
+const CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
+async function getCached<T>(env: Env, key: string): Promise<T | null> {
+  try {
+    const raw = await env.XERO_KV.get(key, "json") as { data: T; cachedAt: number } | null;
+    if (!raw) return null;
+    if (Date.now() - raw.cachedAt > CACHE_TTL_MS) return null; // stale
+    return raw.data;
+  } catch {
+    return null;
+  }
+}
+
+async function setCached<T>(env: Env, key: string, data: T): Promise<void> {
+  try {
+    await env.XERO_KV.put(key, JSON.stringify({ data, cachedAt: Date.now() }), {
+      expirationTtl: 3600, // KV TTL 1 hour — longer than our 30min soft TTL
+    });
+  } catch {
+    // cache write failure is non-fatal
+  }
+}
+
+function wantsRefresh(request: Request): boolean {
+  return new URL(request.url).searchParams.get("refresh") === "true";
+}
+
+
 async function getCostSettings(env: Env): Promise<CostSettings> {
   try {
     const stored = await env.XERO_KV.get("cost_settings", "json") as Partial<CostSettings> | null;
@@ -564,13 +592,13 @@ export default {
     if (path === "/api/events/all")        return handleAllEvents(env);
     if (path === "/api/pipeline")          return handlePipeline(env);
     if (path === "/api/sp-debug")          return handleSpDebug(env);
-    if (path === "/api/xero/invoices")     return handleXeroInvoices(env);
-    if (path === "/api/xero/outgoings")    return handleXeroOutgoings(env);
+    if (path === "/api/xero/invoices")     return handleXeroInvoices(request, env);
+    if (path === "/api/xero/outgoings")    return handleXeroOutgoings(request, env);
     if (path === "/api/xero/balancesheet") return handleXeroBalanceSheet(request, env);
     if (path === "/api/xero/banktx-check") return handleBankTxCheck(env);
     if (path === "/api/xero/bankstatement") return handleXeroBankStatement(request, env);
-    if (path === "/api/xero/payments")      return handleXeroPayments(env);
-    if (path === "/api/xero/cashflow-data") return handleXeroCashflowData(env);
+    if (path === "/api/xero/payments")      return handleXeroPayments(request, env);
+    if (path === "/api/xero/cashflow-data") return handleXeroCashflowData(request, env);
     if (path === "/api/xero/outgoings-debug") return handleXeroOutgoingsDebug(env);
     if (path === "/api/settings") {
       if (method === "GET")  return handleSettingsGet(env);
@@ -1116,7 +1144,12 @@ async function handleProfitAndLoss(env: Env): Promise<Response> {
 }
 
 // ─── NEW: Xero invoices for current year (AUTHORISED + PAID, ACCREC) ──────────
-async function handleXeroInvoices(env: Env): Promise<Response> {
+async function handleXeroInvoices(request: Request, env: Env): Promise<Response> {
+  const CACHE_KEY = `cache_invoices_${new Date().getFullYear()}`;
+  if (!wantsRefresh(request)) {
+    const cached = await getCached<any>(env, CACHE_KEY);
+    if (cached) return Response.json(cached, { headers: { "Access-Control-Allow-Origin": "*", "X-Cache": "HIT" } });
+  }
   let tokens: XeroTokens;
   try { tokens = await getValidTokens(env); } catch (e: any) { return new Response(e.message, { status: 401 }); }
   const h = {
@@ -1157,17 +1190,21 @@ async function handleXeroInvoices(env: Env): Promise<Response> {
     amountPaid:    inv.AmountPaid || 0,
   }));
 
-  return Response.json(
-    { year, count: invoices.length, invoices },
-    { headers: { "Access-Control-Allow-Origin": "*" } }
-  );
+  const result = { year, count: invoices.length, invoices };
+  await setCached(env, CACHE_KEY, result);
+  return Response.json(result, { headers: { "Access-Control-Allow-Origin": "*", "X-Cache": "MISS" } });
 }
 
 // ─── Outgoings by contact — BILLS ONLY (fast, rate-limit safe) ───────────────
 // Bank transactions removed — too slow/rate-limited. The cashflow-data endpoint
 // handles direct bank transactions for the cash flow sheet. This endpoint only
 // needs bills for the contact categorisation tab.
-async function handleXeroOutgoings(env: Env): Promise<Response> {
+async function handleXeroOutgoings(request: Request, env: Env): Promise<Response> {
+  const CACHE_KEY = `cache_outgoings_${new Date().getFullYear()}`;
+  if (!wantsRefresh(request)) {
+    const cached = await getCached<any>(env, CACHE_KEY);
+    if (cached) return Response.json(cached, { headers: { "Access-Control-Allow-Origin": "*", "X-Cache": "HIT" } });
+  }
   let tokens: XeroTokens;
   try { tokens = await getValidTokens(env); } catch (e: any) { return new Response(e.message, { status: 401 }); }
   const h = {
@@ -1276,7 +1313,9 @@ async function handleXeroOutgoings(env: Env): Promise<Response> {
     byMonth: Object.fromEntries(Object.entries(byMonth).sort()),
     transactionCount: transactions.length,
     transactions,
-  }, { headers: { "Access-Control-Allow-Origin": "*" } });
+  };
+  await setCached(env, CACHE_KEY, result);
+  return Response.json(result, { headers: { "Access-Control-Allow-Origin": "*", "X-Cache": "MISS" } });
 }
 
 // ─── NEW: Balance Sheet at a specific date ────────────────────────────────────
@@ -1569,7 +1608,12 @@ async function handleXeroBankStatement(request: Request, env: Env): Promise<Resp
 // Xero /Payments endpoint returns all payments against invoices (both ACCREC
 // receipts and ACCPAY bill payments). Combined with BankTransactions this gives
 // a complete cash movement picture without needing report scopes.
-async function handleXeroPayments(env: Env): Promise<Response> {
+async function handleXeroPayments(request: Request, env: Env): Promise<Response> {
+  const CACHE_KEY = `cache_payments_${new Date().getFullYear()}`;
+  if (!wantsRefresh(request)) {
+    const cached = await getCached<any>(env, CACHE_KEY);
+    if (cached) return Response.json(cached, { headers: { "Access-Control-Allow-Origin": "*", "X-Cache": "HIT" } });
+  }
   let tokens: XeroTokens;
   try { tokens = await getValidTokens(env); } catch (e: any) { return new Response(e.message, { status: 401 }); }
   const h = {
@@ -1640,7 +1684,7 @@ async function handleXeroPayments(env: Env): Promise<Response> {
   const totalIn  = payments.filter(p => p.direction === "in") .reduce((a, p) => a + p.amount, 0);
   const totalOut = payments.filter(p => p.direction === "out").reduce((a, p) => a + p.amount, 0);
 
-  return Response.json({
+  const result = {
     year,
     totalPaymentsFetched: allPayments.length,
     paymentsThisYear:     paymentsThisYear.length,
@@ -1648,14 +1692,21 @@ async function handleXeroPayments(env: Env): Promise<Response> {
     totalOut,
     byMonth: Object.fromEntries(Object.entries(byMonth).sort()),
     payments,
-  }, { headers: { "Access-Control-Allow-Origin": "*" } });
+  };
+  await setCached(env, `cache_payments_${year}`, result);
+  return Response.json(result, { headers: { "Access-Control-Allow-Origin": "*", "X-Cache": "MISS" } });
 }
 
 // ─── NEW: Combined cash flow data — payments + invoices + direct bank tx ──────
 // Fetches everything the cash flow sheet needs in one call to avoid rate limits.
 // Returns: payments (ACCREC receipts + ACCPAY payments), invoices (AUTHORISED),
 // and direct bank transactions (not covered by payments).
-async function handleXeroCashflowData(env: Env): Promise<Response> {
+async function handleXeroCashflowData(request: Request, env: Env): Promise<Response> {
+  const CACHE_KEY = `cache_cashflow_${new Date().getFullYear()}`;
+  if (!wantsRefresh(request)) {
+    const cached = await getCached<any>(env, CACHE_KEY);
+    if (cached) return Response.json(cached, { headers: { "Access-Control-Allow-Origin": "*", "X-Cache": "HIT" } });
+  }
   let tokens: XeroTokens;
   try { tokens = await getValidTokens(env); } catch (e: any) { return new Response(e.message, { status: 401 }); }
   const h = {
@@ -1802,7 +1853,7 @@ async function handleXeroCashflowData(env: Env): Promise<Response> {
     else                       paymentsByMonth[p.month].out += p.amount;
   }
 
-  return Response.json({
+  const result = {
     year,
     payments,
     paymentsByMonth,
@@ -1814,7 +1865,9 @@ async function handleXeroCashflowData(env: Env): Promise<Response> {
       invoices:           invoices.length,
       directTransactions: directTransactions.length,
     },
-  }, { headers: { "Access-Control-Allow-Origin": "*" } });
+  };
+  await setCached(env, CACHE_KEY, result);
+  return Response.json(result, { headers: { "Access-Control-Allow-Origin": "*", "X-Cache": "MISS" } });
 }
 
 // ─── Debug: outgoings date filter test ───────────────────────────────────────
