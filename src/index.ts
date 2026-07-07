@@ -1719,12 +1719,17 @@ async function handleXeroCashflowData(request: Request, env: Env): Promise<Respo
   const yearStart = new Date(year, 0, 1);
   const yearEnd   = new Date(year, 11, 31, 23, 59, 59);
 
+  const errors: string[] = [];
   async function fetchAllPages(endpoint: string, key: string): Promise<any[]> {
     let all: any[] = [];
     let page = 1;
     while (true) {
       const res = await fetch(`${XERO_API_BASE}${endpoint}&page=${page}`, { headers: h });
-      if (!res.ok) break;
+      if (!res.ok) {
+        const errText = await res.text();
+        errors.push(`${endpoint} page ${page}: HTTP ${res.status} — ${errText.substring(0, 100)}`);
+        break;
+      }
       const data: any = await res.json();
       const records = data[key] || [];
       all = all.concat(records);
@@ -1865,6 +1870,7 @@ async function handleXeroCashflowData(request: Request, env: Env): Promise<Respo
       invoices:           invoices.length,
       directTransactions: directTransactions.length,
     },
+    errors,
   };
   await setCached(env, CACHE_KEY, result);
   return Response.json(result, { headers: { "Access-Control-Allow-Origin": "*", "X-Cache": "MISS" } });
