@@ -1736,6 +1736,7 @@ async function handleXeroCashflowData(request: Request, env: Env): Promise<Respo
       if (records.length < 100) break;
       page++;
       if (page > 30) break;
+      await new Promise(resolve => setTimeout(resolve, 500)); // 500ms between pages
     }
     return all;
   }
@@ -1745,13 +1746,11 @@ async function handleXeroCashflowData(request: Request, env: Env): Promise<Respo
     return d && d >= yearStart && d <= yearEnd;
   });
 
-  // Fetch all four data sources in parallel
-  const [allPayments, allInvoices, allBills, allTx] = await Promise.all([
-    fetchAllPages(`/Payments?order=Date+DESC`, "Payments"),
-    fetchAllPages(`/Invoices?where=${encodeURIComponent('Type=="ACCREC"&&(Status=="AUTHORISED"||Status=="PAID")')}&order=DateString+ASC`, "Invoices"),
-    fetchAllPages(`/Invoices?where=${encodeURIComponent('Type=="ACCPAY"')}&order=Date+DESC`, "Invoices"),
-    fetchAllPages(`/BankTransactions?order=Date+DESC`, "BankTransactions"),
-  ]);
+  // Fetch sequentially to avoid rate limiting — parallel was triggering 429s
+  const allPayments = await fetchAllPages(`/Payments?order=Date+DESC`, "Payments");
+  const allInvoices = await fetchAllPages(`/Invoices?where=${encodeURIComponent('Type=="ACCREC"&&(Status=="AUTHORISED"||Status=="PAID")')}&order=DateString+ASC`, "Invoices");
+  const allBills    = await fetchAllPages(`/Invoices?where=${encodeURIComponent('Type=="ACCPAY"')}&order=Date+DESC`, "Invoices");
+  const allTx       = await fetchAllPages(`/BankTransactions?order=Date+DESC`, "BankTransactions");
 
   // ── Payments: invoice receipts + bill payments ────────────
   const paymentsThisYear = filterYear(allPayments).filter((p: any) => p.Status !== "VOIDED");
