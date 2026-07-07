@@ -1299,7 +1299,7 @@ async function handleXeroOutgoings(request: Request, env: Env): Promise<Response
   }
   transactions.sort((a, b) => a.date.localeCompare(b.date));
 
-  return Response.json({
+  const result = {
     year,
     billCount: billsThisYear.length,
     directSpendCount: 0,
