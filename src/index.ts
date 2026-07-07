@@ -567,6 +567,11 @@ export default {
     if (path === "/api/xero/invoices")     return handleXeroInvoices(env);
     if (path === "/api/xero/outgoings")    return handleXeroOutgoings(env);
     if (path === "/api/xero/balancesheet") return handleXeroBalanceSheet(request, env);
+    if (path === "/api/xero/banktx-check") return handleBankTxCheck(env);
+    if (path === "/api/xero/bankstatement") return handleXeroBankStatement(request, env);
+    if (path === "/api/xero/payments")      return handleXeroPayments(env);
+    if (path === "/api/xero/cashflow-data") return handleXeroCashflowData(env);
+    if (path === "/api/xero/outgoings-debug") return handleXeroOutgoingsDebug(env);
     if (path === "/api/settings") {
       if (method === "GET")  return handleSettingsGet(env);
       if (method === "POST") return handleSettingsPost(request, env);
@@ -581,9 +586,12 @@ function redirectToXero(env: Env): Response {
   const params = new URLSearchParams({
     response_type: "code", response_mode: "query", client_id: env.XERO_CLIENT_ID,
     redirect_uri: env.XERO_REDIRECT_URI,
-    scope: ["openid","profile","email","offline_access","accounting.invoices","accounting.payments",
-      "accounting.banktransactions","accounting.manualjournals","accounting.settings",
-      "accounting.reports.read"].join(" "),
+    scope: ["openid","profile","email","offline_access",
+      "accounting.invoices","accounting.payments",
+      "accounting.banktransactions","accounting.manualjournals",
+      "accounting.settings",
+      "accounting.reports.balancesheet.read",
+      "accounting.reports.banksummary.read"].join(" "),
   });
   return Response.redirect(`${XERO_AUTH_URL}?${params}`, 302);
 }
@@ -1155,13 +1163,10 @@ async function handleXeroInvoices(env: Env): Promise<Response> {
   );
 }
 
-// ─── NEW: Outgoings by contact — Bills (ACCPAY) + bank SPEND this year ────────
-// Xero's list endpoints don't return LineItems (so account-code grouping isn't
-// available without fetching every record individually — too slow/rate-limit
-// risky for hundreds of records). Groups by Contact name instead, which is
-// already present on the list response. Also: the `where` date filter on
-// Invoices was unreliable (returned records from outside the requested range),
-// so date filtering happens client-side here using parsed dates instead.
+// ─── Outgoings by contact — BILLS ONLY (fast, rate-limit safe) ───────────────
+// Bank transactions removed — too slow/rate-limited. The cashflow-data endpoint
+// handles direct bank transactions for the cash flow sheet. This endpoint only
+// needs bills for the contact categorisation tab.
 async function handleXeroOutgoings(env: Env): Promise<Response> {
   let tokens: XeroTokens;
   try { tokens = await getValidTokens(env); } catch (e: any) { return new Response(e.message, { status: 401 }); }
@@ -1171,209 +1176,107 @@ async function handleXeroOutgoings(env: Env): Promise<Response> {
     Accept: "application/json",
   };
 
-  const year = new Date().getFullYear();
+  const year     = new Date().getFullYear();
   const yearStart = new Date(year, 0, 1);
   const yearEnd   = new Date(year, 11, 31, 23, 59, 59);
+  const fromDate  = `${year}-01-01`;
 
-  // Fetch ALL ACCPAY bills and ALL bank transactions — no server-side date
-  // filter (unreliable), filter client-side instead. Xero paginates at 100
-  // records per page for these endpoints.
-  async function fetchAllPages(endpoint: string): Promise<any[]> {
-    let all: any[] = [];
-    let page = 1;
-    while (true) {
-      const res = await fetch(`${XERO_API_BASE}${endpoint}&page=${page}`, { headers: h });
-      if (!res.ok) break;
-      const data: any = await res.json();
-      const key = endpoint.includes("Invoices") ? "Invoices" : "BankTransactions";
-      const records = data[key] || [];
-      all = all.concat(records);
-      if (records.length < 100) break; // last page
-      page++;
-      if (page > 20) break; // safety cap — 2000 records
-    }
-    return all;
+  // Fetch only ACCPAY bills — small dataset, fast
+  let allBills: any[] = [];
+  let page = 1;
+  while (true) {
+    const res = await fetch(
+      `${XERO_API_BASE}/Invoices?where=${encodeURIComponent('Type=="ACCPAY"')}&fromDate=${fromDate}&order=Date+DESC&page=${page}`,
+      { headers: h }
+    );
+    if (!res.ok) break;
+    const data: any = await res.json();
+    const records = data.Invoices || [];
+    allBills = allBills.concat(records);
+    if (records.length < 100) break;
+    page++;
+    if (page > 10) break; // safety cap
   }
 
-  const [allBills, allTx] = await Promise.all([
-    fetchAllPages(`/Invoices?where=${encodeURIComponent('Type=="ACCPAY"')}&order=Date+DESC`),
-    fetchAllPages(`/BankTransactions?order=Date+DESC`),
-  ]);
-
-  // Filter to this year client-side using the actual parsed Date field
-  const billsThisYear = allBills.filter((b) => {
+  const billsThisYear = allBills.filter((b: any) => {
     const d = parseXeroDateObj(b.Date);
-    return d && d >= yearStart && d <= yearEnd;
-  });
-  const txThisYear = allTx.filter((t) => {
-    const d = parseXeroDateObj(t.Date);
-    return d && d >= yearStart && d <= yearEnd;
+    return d && d >= yearStart && d <= yearEnd && b.Status !== "DELETED";
   });
 
-  // Aggregate by contact name
+  // Aggregate by contact
   interface ContactUsage {
     contact: string;
     billCount: number; billTotal: number;
-    spendCount: number; spendTotal: number;
-    receiveCount: number; receiveTotal: number;
-    grandTotal: number; // bills + spend, as outgoings; receive tracked separately
+    directSpendCount: number; directSpendTotal: number;
+    directReceiveCount: number; directReceiveTotal: number;
+    grandTotal: number;
   }
   const byContact: Record<string, ContactUsage> = {};
 
-  function ensure(contact: string): ContactUsage {
+  for (const bill of billsThisYear) {
+    const contact = bill.Contact?.Name || "(no contact)";
     if (!byContact[contact]) {
       byContact[contact] = {
         contact, billCount: 0, billTotal: 0,
-        spendCount: 0, spendTotal: 0,
-        receiveCount: 0, receiveTotal: 0,
+        directSpendCount: 0, directSpendTotal: 0,
+        directReceiveCount: 0, directReceiveTotal: 0,
         grandTotal: 0,
       };
     }
-    return byContact[contact];
+    byContact[contact].billCount++;
+    byContact[contact].billTotal  += bill.Total || 0;
+    byContact[contact].grandTotal += bill.Total || 0;
   }
 
+  const contactList = Object.keys(byContact)
+    .map(k => byContact[k])
+    .sort((a, b) => b.grandTotal - a.grandTotal);
+
+  // Monthly bill breakdown
+  const byMonth: Record<string, { billTotal: number; billCount: number; directSpendTotal: number; directSpendCount: number; directReceiveTotal: number; directReceiveCount: number }> = {};
   for (const bill of billsThisYear) {
-    const contact = bill.Contact?.Name || "(no contact)";
-    const c = ensure(contact);
-    c.billCount += 1;
-    c.billTotal += bill.Total || 0;
-    c.grandTotal += bill.Total || 0;
-  }
-
-  for (const tx of txThisYear) {
-    const contact = tx.Contact?.Name || "(no contact)";
-    const c = ensure(contact);
-    if (tx.Type === "SPEND" || tx.Type === "SPEND-OVERPAYMENT") {
-      c.spendCount += 1;
-      c.spendTotal += tx.Total || 0;
-      c.grandTotal += tx.Total || 0;
-    } else if (tx.Type === "RECEIVE" || tx.Type === "RECEIVE-OVERPAYMENT") {
-      c.receiveCount += 1;
-      c.receiveTotal += tx.Total || 0;
-    }
-  }
-
-  const contactList = Object.values(byContact).sort((a, b) => b.grandTotal - a.grandTotal);
-
-  // Monthly breakdown — bills by Date, bank tx by Date. Gives cadence visibility
-  // for fixed-cost forecasting (e.g. "pension goes out every month around the 28th").
-  interface MonthUsage {
-    month: string; // YYYY-MM
-    billTotal: number; billCount: number;
-    spendTotal: number; spendCount: number;
-    receiveTotal: number; receiveCount: number;
-    netOutgoing: number;
-  }
-  const byMonth: Record<string, MonthUsage> = {};
-
-  function ensureMonth(month: string): MonthUsage {
-    if (!byMonth[month]) {
-      byMonth[month] = {
-        month, billTotal: 0, billCount: 0,
-        spendTotal: 0, spendCount: 0,
-        receiveTotal: 0, receiveCount: 0,
-        netOutgoing: 0,
-      };
-    }
-    return byMonth[month];
-  }
-
-  for (const bill of billsThisYear) {
-    const d = parseXeroDateObj(bill.Date);
-    if (!d) continue;
+    const d = parseXeroDateObj(bill.Date); if (!d) continue;
     const month = d.toISOString().substring(0, 7);
-    const m = ensureMonth(month);
-    m.billTotal += bill.Total || 0;
-    m.billCount += 1;
+    if (!byMonth[month]) byMonth[month] = { billTotal: 0, billCount: 0, directSpendTotal: 0, directSpendCount: 0, directReceiveTotal: 0, directReceiveCount: 0 };
+    byMonth[month].billTotal += bill.Total || 0;
+    byMonth[month].billCount++;
   }
 
-  for (const tx of txThisYear) {
-    const d = parseXeroDateObj(tx.Date);
-    if (!d) continue;
-    const month = d.toISOString().substring(0, 7);
-    const m = ensureMonth(month);
-    if (tx.Type === "SPEND" || tx.Type === "SPEND-OVERPAYMENT") {
-      m.spendTotal += tx.Total || 0;
-      m.spendCount += 1;
-    } else if (tx.Type === "RECEIVE" || tx.Type === "RECEIVE-OVERPAYMENT") {
-      m.receiveTotal += tx.Total || 0;
-      m.receiveCount += 1;
-    }
-  }
-
-  const monthList = Object.values(byMonth)
-    .map((m) => ({ ...m, netOutgoing: m.billTotal + m.spendTotal - m.receiveTotal }))
-    .sort((a, b) => a.month.localeCompare(b.month));
-
-  const totalBillSpend    = billsThisYear.reduce((a, b) => a + (b.Total || 0), 0);
-  const totalBankSpend    = txThisYear.filter(t => t.Type === "SPEND" || t.Type === "SPEND-OVERPAYMENT").reduce((a, t) => a + (t.Total || 0), 0);
-  const totalBankReceive  = txThisYear.filter(t => t.Type === "RECEIVE" || t.Type === "RECEIVE-OVERPAYMENT").reduce((a, t) => a + (t.Total || 0), 0);
-
-  // Flat transaction-level export — one row per bill and per bank transaction.
-  // Lets the sheet build its own category × month pivots using SUMIFS against
-  // whatever Category mapping has been applied to each contact.
+  // Flat transaction list — bills only
   interface OutgoingTxn {
-    date: string;      // YYYY-MM-DD
-    month: string;      // YYYY-MM
-    contact: string;
-    type: string;        // "Bill" | "SPEND" | "SPEND-OVERPAYMENT" | "RECEIVE" | "RECEIVE-OVERPAYMENT"
-    reference: string;
-    invoiceNumber: string;
-    amount: number;
-    status: string;
+    date: string; month: string; contact: string;
+    type: string; reference: string; invoiceNumber: string;
+    amount: number; status: string; source: string;
   }
   const transactions: OutgoingTxn[] = [];
-
   for (const bill of billsThisYear) {
-    const d = parseXeroDateObj(bill.Date);
-    if (!d) continue;
+    const d = parseXeroDateObj(bill.Date); if (!d) continue;
     transactions.push({
-      date: toISO(d),
-      month: d.toISOString().substring(0, 7),
+      date: toISO(d), month: d.toISOString().substring(0, 7),
       contact: bill.Contact?.Name || "(no contact)",
-      type: "Bill",
-      reference: bill.Reference || "",
+      type: "Bill", reference: bill.Reference || "",
       invoiceNumber: bill.InvoiceNumber || "",
-      amount: bill.Total || 0,
-      status: bill.Status || "",
+      amount: bill.Total || 0, status: bill.Status || "",
+      source: "Bill",
     });
   }
-
-  for (const tx of txThisYear) {
-    if (tx.Type !== "SPEND" && tx.Type !== "SPEND-OVERPAYMENT" &&
-        tx.Type !== "RECEIVE" && tx.Type !== "RECEIVE-OVERPAYMENT") continue;
-    const d = parseXeroDateObj(tx.Date);
-    if (!d) continue;
-    transactions.push({
-      date: toISO(d),
-      month: d.toISOString().substring(0, 7),
-      contact: tx.Contact?.Name || "(no contact)",
-      type: tx.Type,
-      reference: tx.Reference || "",
-      invoiceNumber: "",
-      amount: tx.Total || 0,
-      status: tx.Status || "",
-    });
-  }
-
   transactions.sort((a, b) => a.date.localeCompare(b.date));
 
-  return Response.json(
-    {
-      year,
-      billCount: billsThisYear.length,
-      txCount: txThisYear.length,
-      totalBillSpend,
-      totalBankSpend,
-      totalBankReceive,
-      contactCount: contactList.length,
-      byContact: contactList,
-      byMonth: monthList,
-      transactionCount: transactions.length,
-      transactions,
-    },
-    { headers: { "Access-Control-Allow-Origin": "*" } }
-  );
+  return Response.json({
+    year,
+    billCount: billsThisYear.length,
+    directSpendCount: 0,
+    directReceiveCount: 0,
+    totalBillSpend: billsThisYear.reduce((a: number, b: any) => a + (b.Total || 0), 0),
+    totalDirectSpend: 0,
+    totalDirectReceive: 0,
+    note: "Bills only — direct bank transactions now handled by /cashflow-data endpoint",
+    contactCount: contactList.length,
+    byContact: contactList,
+    byMonth: Object.fromEntries(Object.entries(byMonth).sort()),
+    transactionCount: transactions.length,
+    transactions,
+  }, { headers: { "Access-Control-Allow-Origin": "*" } });
 }
 
 // ─── NEW: Balance Sheet at a specific date ────────────────────────────────────
@@ -1446,6 +1349,498 @@ async function handleXeroBalanceSheet(request: Request, env: Env): Promise<Respo
     { date, total, accounts },
     { headers: { "Access-Control-Allow-Origin": "*" } }
   );
+}
+
+// ─── NEW: Bank transaction diagnostic ────────────────────────────────────────
+// Checks total transaction count, date range, and running balance to help
+// diagnose why cash flow balance differs from Xero's live balance.
+async function handleBankTxCheck(env: Env): Promise<Response> {
+  let tokens: XeroTokens;
+  try { tokens = await getValidTokens(env); } catch (e: any) { return new Response(e.message, { status: 401 }); }
+  const h = {
+    Authorization: `Bearer ${tokens.access_token}`,
+    "Xero-tenant-id": tokens.tenant_id,
+    Accept: "application/json",
+  };
+
+  // Fetch ALL bank transactions paginated — no date filter (server-side filter unreliable)
+  let allTx: any[] = [];
+  let page = 1;
+  while (true) {
+    const res = await fetch(`${XERO_API_BASE}/BankTransactions?page=${page}`, { headers: h });
+    if (!res.ok) break;
+    const data: any = await res.json();
+    const records = data.BankTransactions || [];
+    allTx = allTx.concat(records);
+    if (records.length < 100) break;
+    page++;
+    if (page > 50) break; // safety cap — 5000 records
+  }
+
+  // Summarise by year
+  const byYear: Record<string, { spend: number; receive: number; count: number }> = {};
+  let totalSpend = 0, totalReceive = 0;
+
+  for (const tx of allTx) {
+    const d = parseXeroDateObj(tx.Date);
+    if (!d) continue;
+    const year = d.getFullYear().toString();
+    if (!byYear[year]) byYear[year] = { spend: 0, receive: 0, count: 0 };
+    byYear[year].count++;
+    if (tx.Type === "SPEND" || tx.Type === "SPEND-OVERPAYMENT") {
+      byYear[year].spend += tx.Total || 0;
+      totalSpend += tx.Total || 0;
+    } else if (tx.Type === "RECEIVE" || tx.Type === "RECEIVE-OVERPAYMENT") {
+      byYear[year].receive += tx.Total || 0;
+      totalReceive += tx.Total || 0;
+    }
+  }
+
+  // Running balance from all transactions (all time)
+  const impliedBalance = totalReceive - totalSpend;
+
+  // 2026 only
+  const tx2026 = allTx.filter(tx => {
+    const d = parseXeroDateObj(tx.Date);
+    return d && d.getFullYear() === 2026;
+  });
+  const spend2026   = tx2026.filter(t => t.Type==="SPEND"||t.Type==="SPEND-OVERPAYMENT").reduce((a,t)=>a+(t.Total||0),0);
+  const receive2026 = tx2026.filter(t => t.Type==="RECEIVE"||t.Type==="RECEIVE-OVERPAYMENT").reduce((a,t)=>a+(t.Total||0),0);
+
+  return Response.json({
+    totalTxFetched: allTx.length,
+    pagesFetched: page - 1,
+    hitSafetyCap: page > 50,
+    impliedRunningBalance: impliedBalance,
+    totalSpendAllTime: totalSpend,
+    totalReceiveAllTime: totalReceive,
+    byYear: Object.fromEntries(Object.entries(byYear).sort()),
+    year2026: {
+      count: tx2026.length,
+      spend: spend2026,
+      receive: receive2026,
+      net: receive2026 - spend2026,
+    },
+    dateRangeActual: {
+      earliest: allTx.length ? parseXeroDateObj(allTx[allTx.length-1].Date)?.toISOString().substring(0,10) : null,
+      latest:   allTx.length ? parseXeroDateObj(allTx[0].Date)?.toISOString().substring(0,10) : null,
+    },
+  }, { headers: { "Access-Control-Allow-Origin": "*" } });
+}
+
+// ─── NEW: Bank statement for a date range ─────────────────────────────────────
+// Uses Xero's BankStatement report which shows every transaction that hit the
+// bank account — invoice receipts, bill payments, direct spend/receive —
+// giving a complete, reconciled cash movement view.
+// Params: ?from=YYYY-MM-DD&to=YYYY-MM-DD (defaults to current year)
+// Also accepts ?accountId=UUID to specify a particular bank account.
+async function handleXeroBankStatement(request: Request, env: Env): Promise<Response> {
+  let tokens: XeroTokens;
+  try { tokens = await getValidTokens(env); } catch (e: any) { return new Response(e.message, { status: 401 }); }
+  const h = {
+    Authorization: `Bearer ${tokens.access_token}`,
+    "Xero-tenant-id": tokens.tenant_id,
+    Accept: "application/json",
+  };
+
+  const url  = new URL(request.url);
+  const year = new Date().getFullYear();
+  const from = url.searchParams.get("from") || `${year}-01-01`;
+  const to   = url.searchParams.get("to")   || new Date().toISOString().substring(0, 10);
+
+  // Step 1: get bank accounts so we know which account(s) to pull
+  const acctRes = await fetch(
+    `${XERO_API_BASE}/Accounts?where=${encodeURIComponent('Type=="BANK"')}`,
+    { headers: h }
+  );
+  if (!acctRes.ok) return new Response(await acctRes.text(), { status: acctRes.status, headers: { "Access-Control-Allow-Origin": "*" } });
+  const acctData: any = await acctRes.json();
+  const bankAccounts: any[] = acctData.Accounts || [];
+
+  if (bankAccounts.length === 0) {
+    return Response.json({ error: "No bank accounts found" }, { headers: { "Access-Control-Allow-Origin": "*" } });
+  }
+
+  // Use specified account or first one found
+  const accountId = url.searchParams.get("accountId") || bankAccounts[0].AccountID;
+  const accountName = bankAccounts.find((a: any) => a.AccountID === accountId)?.Name || bankAccounts[0].Name;
+
+  // Step 2: fetch the BankStatement report for the account and date range
+  const stmtRes = await fetch(
+    `${XERO_API_BASE}/Reports/BankStatement?bankAccountID=${accountId}&fromDate=${from}&toDate=${to}`,
+    { headers: h }
+  );
+
+  if (!stmtRes.ok) {
+    const errText = await stmtRes.text();
+    // BankStatement report requires accounting.reports.read scope
+    return new Response(errText, {
+      status: stmtRes.status,
+      headers: { "Access-Control-Allow-Origin": "*" },
+    });
+  }
+
+  const stmtData: any = await stmtRes.json();
+
+  // Parse the report rows into a clean transaction list
+  // BankStatement report structure:
+  // Rows[] → RowType=Row with Cells: [Date, Description, Reconciled, Debit, Credit, Balance]
+  interface StmtLine {
+    date: string;
+    description: string;
+    reconciled: boolean;
+    debit: number;     // money out
+    credit: number;    // money in
+    balance: number;
+  }
+
+  const lines: StmtLine[] = [];
+  let openingBalance = 0;
+  let closingBalance = 0;
+
+  const walkRows = (rows: any[]) => {
+    for (const row of rows || []) {
+      if (row.RowType === "Row" && row.Cells?.length >= 5) {
+        const cells = row.Cells;
+        // Skip header rows (date cell won't parse as a date)
+        const dateVal = cells[0]?.Value;
+        if (!dateVal || dateVal === "Date") continue;
+
+        const d = parseXeroDateObj(dateVal);
+        if (!d) continue;
+
+        const debit  = parseFloat((cells[3]?.Value || "0").replace(/[^0-9.-]/g, "")) || 0;
+        const credit = parseFloat((cells[4]?.Value || "0").replace(/[^0-9.-]/g, "")) || 0;
+        const bal    = parseFloat((cells[5]?.Value || "0").replace(/[^0-9.-]/g, "")) || 0;
+
+        lines.push({
+          date:        toISO(d),
+          description: cells[1]?.Value || "",
+          reconciled:  (cells[2]?.Value || "").toLowerCase() === "yes",
+          debit,
+          credit,
+          balance:     bal,
+        });
+      }
+      if (row.RowType === "SummaryRow" && row.Cells) {
+        // Opening/closing balance rows
+        const label = row.Cells[0]?.Value || "";
+        const val   = parseFloat((row.Cells[5]?.Value || "0").replace(/[^0-9.-]/g, "")) || 0;
+        if (label.toLowerCase().includes("opening")) openingBalance = val;
+        if (label.toLowerCase().includes("closing")) closingBalance = val;
+      }
+      if (row.Rows) walkRows(row.Rows);
+    }
+  };
+
+  walkRows(stmtData.Reports?.[0]?.Rows || []);
+
+  // Monthly summary
+  const byMonth: Record<string, { in: number; out: number; count: number }> = {};
+  for (const line of lines) {
+    const month = line.date.substring(0, 7);
+    if (!byMonth[month]) byMonth[month] = { in: 0, out: 0, count: 0 };
+    byMonth[month].in    += line.credit;
+    byMonth[month].out   += line.debit;
+    byMonth[month].count += 1;
+  }
+
+  const totalIn  = lines.reduce((a, l) => a + l.credit, 0);
+  const totalOut = lines.reduce((a, l) => a + l.debit,  0);
+
+  return Response.json({
+    accountId,
+    accountName,
+    availableAccounts: bankAccounts.map((a: any) => ({ id: a.AccountID, name: a.Name })),
+    from,
+    to,
+    openingBalance,
+    closingBalance,
+    totalIn,
+    totalOut,
+    netMovement: totalIn - totalOut,
+    lineCount: lines.length,
+    byMonth: Object.fromEntries(Object.entries(byMonth).sort()),
+    lines,
+  }, { headers: { "Access-Control-Allow-Origin": "*" } });
+}
+
+// ─── NEW: Invoice and bill payments for the year ─────────────────────────────
+// Xero /Payments endpoint returns all payments against invoices (both ACCREC
+// receipts and ACCPAY bill payments). Combined with BankTransactions this gives
+// a complete cash movement picture without needing report scopes.
+async function handleXeroPayments(env: Env): Promise<Response> {
+  let tokens: XeroTokens;
+  try { tokens = await getValidTokens(env); } catch (e: any) { return new Response(e.message, { status: 401 }); }
+  const h = {
+    Authorization: `Bearer ${tokens.access_token}`,
+    "Xero-tenant-id": tokens.tenant_id,
+    Accept: "application/json",
+  };
+
+  const year      = new Date().getFullYear();
+  const yearStart = new Date(year, 0, 1);
+  const yearEnd   = new Date(year, 11, 31, 23, 59, 59);
+
+  // Fetch all payments paginated — filter client-side (server-side date filter unreliable)
+  let allPayments: any[] = [];
+  let page = 1;
+  while (true) {
+    const res = await fetch(`${XERO_API_BASE}/Payments?page=${page}`, { headers: h });
+    if (!res.ok) break;
+    const data: any = await res.json();
+    const records = data.Payments || [];
+    allPayments = allPayments.concat(records);
+    if (records.length < 100) break;
+    page++;
+    if (page > 30) break; // safety cap — 3000 payments
+  }
+
+  // Filter to current year and non-voided
+  const paymentsThisYear = allPayments.filter((p: any) => {
+    if (p.Status === "VOIDED") return false;
+    const d = parseXeroDateObj(p.Date);
+    return d && d >= yearStart && d <= yearEnd;
+  });
+
+  // Separate ACCREC (money in — invoice receipts) from ACCPAY (money out — bill payments)
+  interface PaymentLine {
+    date: string;
+    month: string;
+    type: string;       // ACCREC or ACCPAY
+    contact: string;
+    reference: string;
+    amount: number;
+    direction: string;  // "in" or "out"
+  }
+
+  const payments: PaymentLine[] = paymentsThisYear.map((p: any) => {
+    const d        = parseXeroDateObj(p.Date)!;
+    const isAccrec = p.Invoice?.Type === "ACCREC";
+    return {
+      date:      toISO(d),
+      month:     d.toISOString().substring(0, 7),
+      type:      p.Invoice?.Type || p.PaymentType || "UNKNOWN",
+      contact:   p.Invoice?.Contact?.Name || "",
+      reference: p.Reference || p.Invoice?.InvoiceNumber || "",
+      amount:    p.Amount || 0,
+      direction: isAccrec ? "in" : "out",
+    };
+  });
+
+  // Monthly summary
+  const byMonth: Record<string, { in: number; out: number; count: number }> = {};
+  for (const p of payments) {
+    if (!byMonth[p.month]) byMonth[p.month] = { in: 0, out: 0, count: 0 };
+    if (p.direction === "in")  byMonth[p.month].in  += p.amount;
+    else                       byMonth[p.month].out += p.amount;
+    byMonth[p.month].count++;
+  }
+
+  const totalIn  = payments.filter(p => p.direction === "in") .reduce((a, p) => a + p.amount, 0);
+  const totalOut = payments.filter(p => p.direction === "out").reduce((a, p) => a + p.amount, 0);
+
+  return Response.json({
+    year,
+    totalPaymentsFetched: allPayments.length,
+    paymentsThisYear:     paymentsThisYear.length,
+    totalIn,
+    totalOut,
+    byMonth: Object.fromEntries(Object.entries(byMonth).sort()),
+    payments,
+  }, { headers: { "Access-Control-Allow-Origin": "*" } });
+}
+
+// ─── NEW: Combined cash flow data — payments + invoices + direct bank tx ──────
+// Fetches everything the cash flow sheet needs in one call to avoid rate limits.
+// Returns: payments (ACCREC receipts + ACCPAY payments), invoices (AUTHORISED),
+// and direct bank transactions (not covered by payments).
+async function handleXeroCashflowData(env: Env): Promise<Response> {
+  let tokens: XeroTokens;
+  try { tokens = await getValidTokens(env); } catch (e: any) { return new Response(e.message, { status: 401 }); }
+  const h = {
+    Authorization: `Bearer ${tokens.access_token}`,
+    "Xero-tenant-id": tokens.tenant_id,
+    Accept: "application/json",
+  };
+
+  const year      = new Date().getFullYear();
+  const yearStart = new Date(year, 0, 1);
+  const yearEnd   = new Date(year, 11, 31, 23, 59, 59);
+
+  async function fetchAllPages(endpoint: string, key: string): Promise<any[]> {
+    let all: any[] = [];
+    let page = 1;
+    while (true) {
+      const res = await fetch(`${XERO_API_BASE}${endpoint}&page=${page}`, { headers: h });
+      if (!res.ok) break;
+      const data: any = await res.json();
+      const records = data[key] || [];
+      all = all.concat(records);
+      if (records.length < 100) break;
+      page++;
+      if (page > 30) break;
+    }
+    return all;
+  }
+
+  const filterYear = (items: any[]) => items.filter((i: any) => {
+    const d = parseXeroDateObj(i.Date);
+    return d && d >= yearStart && d <= yearEnd;
+  });
+
+  // Fetch all four data sources in parallel
+  const [allPayments, allInvoices, allBills, allTx] = await Promise.all([
+    fetchAllPages(`/Payments?order=Date+DESC`, "Payments"),
+    fetchAllPages(`/Invoices?where=${encodeURIComponent('Type=="ACCREC"&&(Status=="AUTHORISED"||Status=="PAID")')}&order=DateString+ASC`, "Invoices"),
+    fetchAllPages(`/Invoices?where=${encodeURIComponent('Type=="ACCPAY"')}&order=Date+DESC`, "Invoices"),
+    fetchAllPages(`/BankTransactions?order=Date+DESC`, "BankTransactions"),
+  ]);
+
+  // ── Payments: invoice receipts + bill payments ────────────
+  const paymentsThisYear = filterYear(allPayments).filter((p: any) => p.Status !== "VOIDED");
+
+  interface PaymentLine {
+    date: string; month: string; type: string;
+    contact: string; reference: string; amount: number; direction: string;
+  }
+  const payments: PaymentLine[] = paymentsThisYear.map((p: any) => {
+    const d        = parseXeroDateObj(p.Date)!;
+    const isAccrec = p.Invoice?.Type === "ACCREC";
+    return {
+      date:      toISO(d),
+      month:     d.toISOString().substring(0, 7),
+      type:      p.Invoice?.Type || p.PaymentType || "UNKNOWN",
+      contact:   p.Invoice?.Contact?.Name || "",
+      reference: p.Reference || p.Invoice?.InvoiceNumber || "",
+      amount:    p.Amount || 0,
+      direction: isAccrec ? "in" : "out",
+    };
+  });
+
+  // ── Invoices: AUTHORISED only (outstanding — expected future income) ──
+  const invoicesThisYear = allInvoices.filter((inv: any) => {
+    const d = parseXeroDateObj(inv.Date);
+    return d && d >= yearStart && d <= yearEnd;
+  });
+
+  const invoices = invoicesThisYear.map((inv: any) => ({
+    invoiceNumber: inv.InvoiceNumber || "",
+    reference:     inv.Reference || "",
+    contact:       inv.Contact?.Name || "",
+    date:          parseXeroDateFull(inv.Date),
+    dueDate:       parseXeroDateFull(inv.DueDate),
+    paidDate:      inv.FullyPaidOnDate ? parseXeroDateFull(inv.FullyPaidOnDate) : "",
+    status:        inv.Status || "",
+    subTotal:      inv.SubTotal  || 0,
+    totalTax:      inv.TotalTax  || 0,
+    total:         inv.Total     || 0,
+    amountDue:     inv.AmountDue || 0,
+    amountPaid:    inv.AmountPaid || 0,
+  }));
+
+  // ── Direct bank transactions (not covered by payments) ────
+  const billsThisYear = filterYear(allBills);
+  const txThisYear    = filterYear(allTx);
+
+  // Build payment key sets for deduplication
+  const billPaymentKeys    = new Set<string>();
+  const invoiceReceiptKeys = new Set<string>();
+  for (const p of paymentsThisYear) {
+    const d = parseXeroDateObj(p.Date);
+    if (!d) continue;
+    const key = `${toISO(d)}|${(p.Amount||0).toFixed(2)}`;
+    if (p.Invoice?.Type === "ACCPAY")   billPaymentKeys.add(key);
+    if (p.Invoice?.Type === "ACCREC" || p.Invoice?.Type === "ACCRECCREDIT") invoiceReceiptKeys.add(key);
+  }
+
+  interface DirectTx {
+    date: string; month: string; contact: string;
+    type: string; reference: string; amount: number; source: string;
+  }
+  const directTransactions: DirectTx[] = [];
+
+  // Monthly direct spend/receive
+  interface MonthTotals { directSpendTotal: number; directReceiveTotal: number; }
+  const byMonth: Record<string, MonthTotals> = {};
+
+  for (const tx of txThisYear) {
+    if (tx.Status === "DELETED") continue;
+    if (tx.Type !== "SPEND" && tx.Type !== "SPEND-OVERPAYMENT" &&
+        tx.Type !== "RECEIVE" && tx.Type !== "RECEIVE-OVERPAYMENT") continue;
+    const d = parseXeroDateObj(tx.Date);
+    if (!d) continue;
+    const key    = `${toISO(d)}|${(tx.Total||0).toFixed(2)}`;
+    const isSpend = tx.Type === "SPEND" || tx.Type === "SPEND-OVERPAYMENT";
+    const month  = d.toISOString().substring(0, 7);
+
+    if (isSpend && billPaymentKeys.has(key))    continue; // covered by bill payment
+    if (!isSpend && invoiceReceiptKeys.has(key)) continue; // covered by invoice receipt
+
+    if (!byMonth[month]) byMonth[month] = { directSpendTotal: 0, directReceiveTotal: 0 };
+    if (isSpend) byMonth[month].directSpendTotal   += tx.Total || 0;
+    else         byMonth[month].directReceiveTotal += tx.Total || 0;
+
+    directTransactions.push({
+      date:      toISO(d),
+      month,
+      contact:   tx.Contact?.Name || "(no contact)",
+      type:      tx.Type,
+      reference: tx.Reference || "",
+      amount:    tx.Total || 0,
+      source:    isSpend ? "DirectSpend" : "DirectReceive",
+    });
+  }
+
+  directTransactions.sort((a, b) => a.date.localeCompare(b.date));
+
+  // Payments monthly summary
+  const paymentsByMonth: Record<string, { in: number; out: number }> = {};
+  for (const p of payments) {
+    if (!paymentsByMonth[p.month]) paymentsByMonth[p.month] = { in: 0, out: 0 };
+    if (p.direction === "in")  paymentsByMonth[p.month].in  += p.amount;
+    else                       paymentsByMonth[p.month].out += p.amount;
+  }
+
+  return Response.json({
+    year,
+    payments,
+    paymentsByMonth,
+    invoices,
+    directTransactions,
+    directByMonth: byMonth,
+    counts: {
+      payments:           payments.length,
+      invoices:           invoices.length,
+      directTransactions: directTransactions.length,
+    },
+  }, { headers: { "Access-Control-Allow-Origin": "*" } });
+}
+
+// ─── Debug: outgoings date filter test ───────────────────────────────────────
+async function handleXeroOutgoingsDebug(env: Env): Promise<Response> {
+  let tokens: XeroTokens;
+  try { tokens = await getValidTokens(env); } catch (e: any) { return new Response(e.message, { status: 401 }); }
+  const h = { Authorization: `Bearer ${tokens.access_token}`, "Xero-tenant-id": tokens.tenant_id, Accept: "application/json" };
+
+  const year = new Date().getFullYear();
+
+  // Test fromDate filter — just page 1
+  const res = await fetch(`${XERO_API_BASE}/BankTransactions?fromDate=${year}-01-01&page=1`, { headers: h });
+  const raw = await res.text();
+  let parsed: any = null;
+  try { parsed = JSON.parse(raw); } catch {}
+
+  const txList = parsed?.BankTransactions || [];
+  const firstTx = txList[0] || null;
+
+  return Response.json({
+    status: res.status,
+    count: txList.length,
+    firstDate: firstTx?.DateString || firstTx?.Date || "none",
+    firstContact: firstTx?.Contact?.Name || "none",
+    firstAmount: firstTx?.Total || 0,
+  }, { headers: { "Access-Control-Allow-Origin": "*" } });
 }
 
 // ─── Page serving ─────────────────────────────────────────────────────────────
