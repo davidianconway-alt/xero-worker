@@ -1755,20 +1755,34 @@ async function handleXeroCashflowData(request: Request, env: Env): Promise<Respo
   // ── Payments: invoice receipts + bill payments ────────────
   const paymentsThisYear = filterYear(allPayments).filter((p: any) => p.Status !== "VOIDED");
 
+  // Build invoice tax ratio lookup: InvoiceID → taxRate (TotalTax/Total)
+  // Used to apportion VAT to individual payments against invoices
+  const invoiceTaxRatio: Record<string, number> = {};
+  for (const inv of [...allInvoices, ...allBills]) {
+    if (inv.InvoiceID && inv.Total > 0) {
+      invoiceTaxRatio[inv.InvoiceID] = (inv.TotalTax || 0) / inv.Total;
+    }
+  }
+
   interface PaymentLine {
     date: string; month: string; type: string;
-    contact: string; reference: string; amount: number; direction: string;
+    contact: string; reference: string; amount: number;
+    vatAmount: number;  // VAT portion of this payment
+    direction: string;
   }
   const payments: PaymentLine[] = paymentsThisYear.map((p: any) => {
     const d        = parseXeroDateObj(p.Date)!;
     const isAccrec = p.Invoice?.Type === "ACCREC";
+    const taxRatio = p.Invoice?.InvoiceID ? (invoiceTaxRatio[p.Invoice.InvoiceID] || 0) : 0;
+    const amount   = p.Amount || 0;
     return {
       date:      toISO(d),
       month:     d.toISOString().substring(0, 7),
       type:      p.Invoice?.Type || p.PaymentType || "UNKNOWN",
       contact:   p.Invoice?.Contact?.Name || "",
       reference: p.Reference || p.Invoice?.InvoiceNumber || "",
-      amount:    p.Amount || 0,
+      amount,
+      vatAmount: amount * taxRatio,  // proportional VAT
       direction: isAccrec ? "in" : "out",
     };
   });
@@ -1811,12 +1825,17 @@ async function handleXeroCashflowData(request: Request, env: Env): Promise<Respo
 
   interface DirectTx {
     date: string; month: string; contact: string;
-    type: string; reference: string; amount: number; source: string;
+    type: string; reference: string; amount: number;
+    totalTax: number;  // VAT on this transaction
+    source: string;
   }
   const directTransactions: DirectTx[] = [];
 
-  // Monthly direct spend/receive
-  interface MonthTotals { directSpendTotal: number; directReceiveTotal: number; }
+  // Monthly direct spend/receive with VAT totals
+  interface MonthTotals {
+    directSpendTotal: number; directReceiveTotal: number;
+    directSpendVat: number;   directReceiveVat: number;
+  }
   const byMonth: Record<string, MonthTotals> = {};
 
   for (const tx of txThisYear) {
@@ -1828,13 +1847,22 @@ async function handleXeroCashflowData(request: Request, env: Env): Promise<Respo
     const key    = `${toISO(d)}|${(tx.Total||0).toFixed(2)}`;
     const isSpend = tx.Type === "SPEND" || tx.Type === "SPEND-OVERPAYMENT";
     const month  = d.toISOString().substring(0, 7);
+    const txVat  = tx.TotalTax || 0;
 
-    if (isSpend && billPaymentKeys.has(key))    continue; // covered by bill payment
-    if (!isSpend && invoiceReceiptKeys.has(key)) continue; // covered by invoice receipt
+    if (isSpend && billPaymentKeys.has(key))    continue;
+    if (!isSpend && invoiceReceiptKeys.has(key)) continue;
 
-    if (!byMonth[month]) byMonth[month] = { directSpendTotal: 0, directReceiveTotal: 0 };
-    if (isSpend) byMonth[month].directSpendTotal   += tx.Total || 0;
-    else         byMonth[month].directReceiveTotal += tx.Total || 0;
+    if (!byMonth[month]) byMonth[month] = {
+      directSpendTotal: 0, directReceiveTotal: 0,
+      directSpendVat: 0,   directReceiveVat: 0,
+    };
+    if (isSpend) {
+      byMonth[month].directSpendTotal += tx.Total || 0;
+      byMonth[month].directSpendVat   += txVat;
+    } else {
+      byMonth[month].directReceiveTotal += tx.Total || 0;
+      byMonth[month].directReceiveVat   += txVat;
+    }
 
     directTransactions.push({
       date:      toISO(d),
@@ -1843,18 +1871,66 @@ async function handleXeroCashflowData(request: Request, env: Env): Promise<Respo
       type:      tx.Type,
       reference: tx.Reference || "",
       amount:    tx.Total || 0,
+      totalTax:  txVat,
       source:    isSpend ? "DirectSpend" : "DirectReceive",
     });
   }
 
   directTransactions.sort((a, b) => a.date.localeCompare(b.date));
 
-  // Payments monthly summary
-  const paymentsByMonth: Record<string, { in: number; out: number }> = {};
+  // Payments monthly summary including VAT
+  const paymentsByMonth: Record<string, { in: number; out: number; vatIn: number; vatOut: number }> = {};
   for (const p of payments) {
-    if (!paymentsByMonth[p.month]) paymentsByMonth[p.month] = { in: 0, out: 0 };
-    if (p.direction === "in")  paymentsByMonth[p.month].in  += p.amount;
-    else                       paymentsByMonth[p.month].out += p.amount;
+    if (!paymentsByMonth[p.month]) paymentsByMonth[p.month] = { in: 0, out: 0, vatIn: 0, vatOut: 0 };
+    if (p.direction === "in")  {
+      paymentsByMonth[p.month].in    += p.amount;
+      paymentsByMonth[p.month].vatIn += p.vatAmount;
+    } else {
+      paymentsByMonth[p.month].out    += p.amount;
+      paymentsByMonth[p.month].vatOut += p.vatAmount;
+    }
+  }
+
+  // Quarterly VAT calculation (cash accounting — Jan/Apr/Jul/Oct quarters)
+  // Output VAT = VAT on invoice receipts (ACCREC payments) in the quarter
+  // Input VAT  = VAT on bill payments (ACCPAY payments) + VAT on direct spend
+  // Net VAT    = Output - Input (positive = pay HMRC, negative = reclaim)
+  // Payment due = 37 days after quarter end
+  const vatQuarters: Record<string, {
+    months: string[]; paymentDue: string;
+    outputVat: number; inputVatPayments: number; inputVatDirect: number;
+    totalInputVat: number; netVat: number;
+  }> = {};
+
+  const allMonths = Object.keys({ ...paymentsByMonth, ...byMonth }).sort();
+  for (const month of allMonths) {
+    const yr  = parseInt(month.substring(0, 4));
+    const mo  = parseInt(month.substring(5, 7)); // 1-indexed
+    // Quarter: Jan=Q1(Jan-Mar), Apr=Q2(Apr-Jun), Jul=Q3(Jul-Sep), Oct=Q4(Oct-Dec)
+    const qStart = mo <= 3 ? 1 : mo <= 6 ? 4 : mo <= 9 ? 7 : 10;
+    const qKey   = `${yr}-Q${Math.ceil(mo / 3)}`;
+    const qEndDate = new Date(yr, qStart + 2, 0); // last day of quarter
+    const payDue = new Date(qEndDate); payDue.setDate(payDue.getDate() + 37);
+
+    if (!vatQuarters[qKey]) vatQuarters[qKey] = {
+      months: [], paymentDue: toISO(payDue),
+      outputVat: 0, inputVatPayments: 0, inputVatDirect: 0,
+      totalInputVat: 0, netVat: 0,
+    };
+
+    const pm = paymentsByMonth[month] || { in: 0, out: 0, vatIn: 0, vatOut: 0 };
+    const dm = byMonth[month] || { directSpendTotal: 0, directReceiveTotal: 0, directSpendVat: 0, directReceiveVat: 0 };
+
+    vatQuarters[qKey].months.push(month);
+    vatQuarters[qKey].outputVat        += pm.vatIn;
+    vatQuarters[qKey].inputVatPayments += pm.vatOut;
+    vatQuarters[qKey].inputVatDirect   += dm.directSpendVat;
+  }
+
+  for (const qKey of Object.keys(vatQuarters)) {
+    const q = vatQuarters[qKey];
+    q.totalInputVat = q.inputVatPayments + q.inputVatDirect;
+    q.netVat        = q.outputVat - q.totalInputVat;
   }
 
   const result = {
@@ -1864,6 +1940,7 @@ async function handleXeroCashflowData(request: Request, env: Env): Promise<Respo
     invoices,
     directTransactions,
     directByMonth: byMonth,
+    vatQuarters,
     counts: {
       payments:           payments.length,
       invoices:           invoices.length,
