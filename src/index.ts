@@ -361,7 +361,13 @@ function parseXeroDateObj(val: string | undefined | null): Date | null {
 function parseXeroDateFull(val: string | undefined | null): string {
   if (!val) return "";
   const ms = val.match(/\/Date\((\d+)/);
-  if (ms) return new Date(parseInt(ms[1])).toISOString().substring(0, 10);
+  if (ms) {
+    const d = new Date(parseInt(ms[1]));
+    const yr = d.getFullYear();
+    const mo = String(d.getMonth() + 1).padStart(2, '0');
+    const dy = String(d.getDate()).padStart(2, '0');
+    return `${yr}-${mo}-${dy}`;
+  }
   return val.substring(0, 10);
 }
 
@@ -379,6 +385,13 @@ function addDays(d: Date, n: number): Date {
 
 function toISO(d: Date): string {
   return d.toISOString().substring(0, 10);
+}
+
+// Get month as YYYY-MM using LOCAL time (not UTC) to avoid BST timezone shift
+function toLocalMonth(d: Date): string {
+  const yr = d.getFullYear();
+  const mo = d.getMonth() + 1;
+  return `${yr}-${mo < 10 ? '0' + mo : mo}`;
 }
 
 function parseQuotedPrice(raw: string | null): { price: number | null; flag: string } {
@@ -1777,7 +1790,7 @@ async function handleXeroCashflowData(request: Request, env: Env): Promise<Respo
     const amount   = p.Amount || 0;
     return {
       date:      toISO(d),
-      month:     d.toISOString().substring(0, 7),
+      month:     toLocalMonth(d),
       type:      p.Invoice?.Type || p.PaymentType || "UNKNOWN",
       contact:   p.Invoice?.Contact?.Name || "",
       reference: p.Reference || p.Invoice?.InvoiceNumber || "",
@@ -1846,7 +1859,7 @@ async function handleXeroCashflowData(request: Request, env: Env): Promise<Respo
     if (!d) continue;
     const key    = `${toISO(d)}|${(tx.Total||0).toFixed(2)}`;
     const isSpend = tx.Type === "SPEND" || tx.Type === "SPEND-OVERPAYMENT";
-    const month  = d.toISOString().substring(0, 7);
+    const month  = toLocalMonth(d);
     const txVat  = tx.TotalTax || 0;
 
     if (isSpend && billPaymentKeys.has(key))    continue;
