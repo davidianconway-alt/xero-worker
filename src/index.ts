@@ -1794,6 +1794,14 @@ async function handleXeroCashflowData(request: Request, env: Env): Promise<Respo
   const allBills    = await fetchAllPages(`/Invoices?where=${encodeURIComponent('Type=="ACCPAY"')}&order=Date+DESC`, "Invoices");
   const allTx       = await fetchAllPages(`/BankTransactions?order=Date+DESC&summaryOnly=false`, "BankTransactions");
 
+  // Chart of accounts for account code → name lookup
+  const acctRes = await fetch(`${XERO_API_BASE}/Accounts`, { headers: h });
+  const acctData: any = acctRes.ok ? await acctRes.json() : { Accounts: [] };
+  const acctMap: Record<string, string> = {};
+  for (const a of acctData.Accounts || []) {
+    if (a.Code) acctMap[a.Code] = `${a.Code} — ${a.Name}`;
+  }
+
   // ── Payments: invoice receipts + bill payments ────────────
   const paymentsThisYear = filterYear(allPayments).filter((p: any) => p.Status !== "VOIDED");
 
@@ -1869,7 +1877,7 @@ async function handleXeroCashflowData(request: Request, env: Env): Promise<Respo
     date: string; month: string; contact: string;
     type: string; reference: string; amount: number;
     totalTax: number; source: string;
-    accountCode: string; lineDescription: string;
+    accountCode: string; accountName: string; lineDescription: string;
   }
   const directTransactions: DirectTx[] = [];
 
@@ -1907,6 +1915,7 @@ async function handleXeroCashflowData(request: Request, env: Env): Promise<Respo
     }
 
     const firstLine = (tx.LineItems || [])[0];
+    const txCode = firstLine?.AccountCode || "";
     directTransactions.push({
       date:            toISO(d),
       month,
@@ -1916,7 +1925,8 @@ async function handleXeroCashflowData(request: Request, env: Env): Promise<Respo
       amount:          tx.Total || 0,
       totalTax:        txVat,
       source:          isSpend ? "DirectSpend" : "DirectReceive",
-      accountCode:     firstLine?.AccountCode || "",
+      accountCode:     txCode,
+      accountName:     acctMap[txCode] || txCode,
       lineDescription: firstLine?.Description || "",
     });
   }
