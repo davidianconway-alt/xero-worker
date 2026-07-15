@@ -1231,6 +1231,14 @@ async function handleXeroOutgoings(request: Request, env: Env): Promise<Response
   const yearEnd   = new Date(year, 11, 31, 23, 59, 59);
   const fromDate  = `${year}-01-01`;
 
+  // Fetch chart of accounts — one call, no pagination, gives account code → name mapping
+  const accountsRes = await fetch(`${XERO_API_BASE}/Accounts`, { headers: h });
+  const accountsData: any = accountsRes.ok ? await accountsRes.json() : { Accounts: [] };
+  const accountMap: Record<string, string> = {};
+  for (const acct of accountsData.Accounts || []) {
+    if (acct.Code) accountMap[acct.Code] = `${acct.Code} — ${acct.Name}`;
+  }
+
   // Fetch only ACCPAY bills — small dataset, fast
   let allBills: any[] = [];
   let page = 1;
@@ -1304,8 +1312,8 @@ async function handleXeroOutgoings(request: Request, env: Env): Promise<Response
     const d = parseXeroDateObj(bill.Date); if (!d) continue;
     const lineItems: any[] = bill.LineItems || [];
     if (lineItems.length > 0) {
-      // Expand to one row per line item so account codes are visible
       for (const line of lineItems) {
+        const code = line.AccountCode || "";
         transactions.push({
           date: toISO(d), month: toLocalMonth(d),
           contact: bill.Contact?.Name || "(no contact)",
@@ -1314,13 +1322,12 @@ async function handleXeroOutgoings(request: Request, env: Env): Promise<Response
           amount: line.LineAmount || 0,
           status: bill.Status || "",
           source: "Bill",
-          accountCode: line.AccountCode || "",
-          accountName: line.AccountID || "", // AccountName not on list response, use code
+          accountCode: code,
+          accountName: accountMap[code] || code,
           lineDescription: line.Description || "",
         });
       }
     } else {
-      // No line items — push bill total with no account code
       transactions.push({
         date: toISO(d), month: toLocalMonth(d),
         contact: bill.Contact?.Name || "(no contact)",
@@ -1341,6 +1348,7 @@ async function handleXeroOutgoings(request: Request, env: Env): Promise<Response
     totalBillSpend: billsThisYear.reduce((a: number, b: any) => a + (b.Total || 0), 0),
     totalDirectSpend: 0,
     totalDirectReceive: 0,
+    accountCount: Object.keys(accountMap).length,
     note: "Bills only — direct bank transactions now handled by /cashflow-data endpoint",
     contactCount: contactList.length,
     byContact: contactList,
@@ -1784,7 +1792,7 @@ async function handleXeroCashflowData(request: Request, env: Env): Promise<Respo
   const allPayments = await fetchAllPages(`/Payments?order=Date+DESC`, "Payments");
   const allInvoices = await fetchAllPages(`/Invoices?where=${encodeURIComponent('Type=="ACCREC"&&(Status=="AUTHORISED"||Status=="PAID")')}&order=DateString+ASC`, "Invoices");
   const allBills    = await fetchAllPages(`/Invoices?where=${encodeURIComponent('Type=="ACCPAY"')}&order=Date+DESC`, "Invoices");
-  const allTx       = await fetchAllPages(`/BankTransactions?order=Date+DESC`, "BankTransactions");
+  const allTx       = await fetchAllPages(`/BankTransactions?order=Date+DESC&summaryOnly=false`, "BankTransactions");
 
   // ── Payments: invoice receipts + bill payments ────────────
   const paymentsThisYear = filterYear(allPayments).filter((p: any) => p.Status !== "VOIDED");
@@ -1860,8 +1868,8 @@ async function handleXeroCashflowData(request: Request, env: Env): Promise<Respo
   interface DirectTx {
     date: string; month: string; contact: string;
     type: string; reference: string; amount: number;
-    totalTax: number;  // VAT on this transaction
-    source: string;
+    totalTax: number; source: string;
+    accountCode: string; lineDescription: string;
   }
   const directTransactions: DirectTx[] = [];
 
@@ -1898,15 +1906,18 @@ async function handleXeroCashflowData(request: Request, env: Env): Promise<Respo
       byMonth[month].directReceiveVat   += txVat;
     }
 
+    const firstLine = (tx.LineItems || [])[0];
     directTransactions.push({
-      date:      toISO(d),
+      date:            toISO(d),
       month,
-      contact:   tx.Contact?.Name || "(no contact)",
-      type:      tx.Type,
-      reference: tx.Reference || "",
-      amount:    tx.Total || 0,
-      totalTax:  txVat,
-      source:    isSpend ? "DirectSpend" : "DirectReceive",
+      contact:         tx.Contact?.Name || "(no contact)",
+      type:            tx.Type,
+      reference:       tx.Reference || "",
+      amount:          tx.Total || 0,
+      totalTax:        txVat,
+      source:          isSpend ? "DirectSpend" : "DirectReceive",
+      accountCode:     firstLine?.AccountCode || "",
+      lineDescription: firstLine?.Description || "",
     });
   }
 
