@@ -1236,7 +1236,7 @@ async function handleXeroOutgoings(request: Request, env: Env): Promise<Response
   let page = 1;
   while (true) {
     const res = await fetch(
-      `${XERO_API_BASE}/Invoices?where=${encodeURIComponent('Type=="ACCPAY"')}&fromDate=${fromDate}&order=Date+DESC&page=${page}`,
+      `${XERO_API_BASE}/Invoices?where=${encodeURIComponent('Type=="ACCPAY"')}&fromDate=${fromDate}&order=Date+DESC&summaryOnly=false&page=${page}`,
       { headers: h }
     );
     if (!res.ok) break;
@@ -1297,18 +1297,39 @@ async function handleXeroOutgoings(request: Request, env: Env): Promise<Response
     date: string; month: string; contact: string;
     type: string; reference: string; invoiceNumber: string;
     amount: number; status: string; source: string;
+    accountCode: string; accountName: string; lineDescription: string;
   }
   const transactions: OutgoingTxn[] = [];
   for (const bill of billsThisYear) {
     const d = parseXeroDateObj(bill.Date); if (!d) continue;
-    transactions.push({
-      date: toISO(d), month: d.toISOString().substring(0, 7),
-      contact: bill.Contact?.Name || "(no contact)",
-      type: "Bill", reference: bill.Reference || "",
-      invoiceNumber: bill.InvoiceNumber || "",
-      amount: bill.Total || 0, status: bill.Status || "",
-      source: "Bill",
-    });
+    const lineItems: any[] = bill.LineItems || [];
+    if (lineItems.length > 0) {
+      // Expand to one row per line item so account codes are visible
+      for (const line of lineItems) {
+        transactions.push({
+          date: toISO(d), month: toLocalMonth(d),
+          contact: bill.Contact?.Name || "(no contact)",
+          type: "Bill", reference: bill.Reference || "",
+          invoiceNumber: bill.InvoiceNumber || "",
+          amount: line.LineAmount || 0,
+          status: bill.Status || "",
+          source: "Bill",
+          accountCode: line.AccountCode || "",
+          accountName: line.AccountID || "", // AccountName not on list response, use code
+          lineDescription: line.Description || "",
+        });
+      }
+    } else {
+      // No line items — push bill total with no account code
+      transactions.push({
+        date: toISO(d), month: toLocalMonth(d),
+        contact: bill.Contact?.Name || "(no contact)",
+        type: "Bill", reference: bill.Reference || "",
+        invoiceNumber: bill.InvoiceNumber || "",
+        amount: bill.Total || 0, status: bill.Status || "",
+        source: "Bill", accountCode: "", accountName: "", lineDescription: "",
+      });
+    }
   }
   transactions.sort((a, b) => a.date.localeCompare(b.date));
 
