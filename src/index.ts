@@ -2190,11 +2190,28 @@ async function handleXeroPnlByCode(request: Request, env: Env): Promise<Response
   const chartByCode: Record<string, ChartAccount> = {};
   for (const a of chart) chartByCode[a.code] = a;
 
-  interface CodeTotal { code: string; name: string; type: string; gross: number; vat: number; count: number; }
+  const months: string[] = [];
+  for (let m = 1; m <= 12; m++) months.push(`${year}-${m < 10 ? "0" + m : m}`);
+
+  interface MonthTotal { gross: number; vat: number; count: number; }
+  interface CodeTotal {
+    code: string; name: string; type: string;
+    monthly: Record<string, MonthTotal>;
+    gross: number; vat: number; count: number;
+  }
   const byCode: Record<string, CodeTotal> = {};
-  function addToCode(code: string, name: string, type: string, gross: number, vat: number) {
+  function addToCode(code: string, name: string, type: string, month: string, gross: number, vat: number) {
     const key = code || "(no code)";
-    if (!byCode[key]) byCode[key] = { code: key, name: name || key, type, gross: 0, vat: 0, count: 0 };
+    if (!byCode[key]) {
+      const monthly: Record<string, MonthTotal> = {};
+      for (const m of months) monthly[m] = { gross: 0, vat: 0, count: 0 };
+      byCode[key] = { code: key, name: name || key, type, monthly, gross: 0, vat: 0, count: 0 };
+    }
+    if (byCode[key].monthly[month]) {
+      byCode[key].monthly[month].gross += gross;
+      byCode[key].monthly[month].vat   += vat;
+      byCode[key].monthly[month].count++;
+    }
     byCode[key].gross += gross;
     byCode[key].vat   += vat;
     byCode[key].count++;
@@ -2212,15 +2229,16 @@ async function handleXeroPnlByCode(request: Request, env: Env): Promise<Response
   });
   const salesAccount = chartByCode["200"];
   for (const inv of invoicesThisYear) {
-    addToCode("200", salesAccount?.name || "Sales", salesAccount?.type || "REVENUE", inv.Total || 0, inv.TotalTax || 0);
+    const d = parseXeroDateObj(inv.Date)!;
+    addToCode("200", salesAccount?.name || "Sales", salesAccount?.type || "REVENUE", toLocalMonth(d), inv.Total || 0, inv.TotalTax || 0);
   }
 
   // Bills — reuse the Xero Outgoings cache (already has per-line account
-  // codes + VAT) instead of re-fetching ACCPAY invoices with summaryOnly=false
-  // again here. Doing that fetch AND the bank transactions fetch below in the
-  // same request is what caused the 500/1101 — this endpoint now never does
-  // its own heavy Xero fetches, only cheap reads plus cached data from the
-  // other refreshes.
+  // codes + VAT + month) instead of re-fetching ACCPAY invoices with
+  // summaryOnly=false again here. Doing that fetch AND the bank transactions
+  // fetch below in the same request is what caused the 500/1101 — this
+  // endpoint now never does its own heavy Xero fetches, only cheap reads
+  // plus cached data from the other refreshes.
   const outgoingsCache = await getCached<any>(env, `cache_outgoings_${year}`);
   let billsSource: "cache" | "missing" = "missing";
   if (outgoingsCache?.transactions?.length) {
@@ -2229,7 +2247,7 @@ async function handleXeroPnlByCode(request: Request, env: Env): Promise<Response
       const code = t.accountCode || "";
       const acct = chartByCode[code];
       const gross = (t.amount || 0) + (t.totalTax || 0);
-      addToCode(code, acct?.name || t.accountName || code, acct?.type || "", gross, t.totalTax || 0);
+      addToCode(code, acct?.name || t.accountName || code, acct?.type || "", t.month, gross, t.totalTax || 0);
     }
   } else {
     errors.push("No cached bills data — run 'Refresh Xero Outgoings' first, then refresh this report.");
@@ -2239,12 +2257,12 @@ async function handleXeroPnlByCode(request: Request, env: Env): Promise<Response
   // bank-transactions-detail (populated by 'Refresh Xero Outgoings') instead
   // of re-running the summaryOnly=false BankTransactions + Payments fetch here.
   const bankTxCache = await getCached<any>(env, `cache_banktx_detail_${year}`);
-  let directTx: { accountCode: string; amount: number; totalTax: number }[] = [];
+  let directTx: { accountCode: string; amount: number; totalTax: number; month: string }[] = [];
   if (bankTxCache?.directTransactions?.length) {
     directTx = bankTxCache.directTransactions;
     for (const tx of directTx) {
       const acct = chartByCode[tx.accountCode];
-      addToCode(tx.accountCode, acct?.name || tx.accountCode, acct?.type || "", Math.abs(tx.amount), tx.totalTax || 0);
+      addToCode(tx.accountCode, acct?.name || tx.accountCode, acct?.type || "", tx.month, Math.abs(tx.amount), tx.totalTax || 0);
     }
   } else {
     errors.push("No cached bank transaction data — run 'Refresh Xero Outgoings' first, then refresh this report.");
@@ -2255,7 +2273,11 @@ async function handleXeroPnlByCode(request: Request, env: Env): Promise<Response
   for (const a of chart) {
     const t = (a.type || "").toUpperCase();
     if (t !== "REVENUE" && t !== "EXPENSE" && t !== "DIRECTCOSTS" && t !== "OVERHEADS") continue;
-    if (!byCode[a.code]) byCode[a.code] = { code: a.code, name: a.name, type: a.type, gross: 0, vat: 0, count: 0 };
+    if (!byCode[a.code]) {
+      const monthly: Record<string, MonthTotal> = {};
+      for (const m of months) monthly[m] = { gross: 0, vat: 0, count: 0 };
+      byCode[a.code] = { code: a.code, name: a.name, type: a.type, monthly, gross: 0, vat: 0, count: 0 };
+    }
   }
 
   const codes = Object.values(byCode)
@@ -2286,6 +2308,7 @@ async function handleXeroPnlByCode(request: Request, env: Env): Promise<Response
 
   const result = {
     year,
+    months,
     codes,
     dataSources: { bills: billsSource, bankTransactions: bankTxCache?.directTransactions?.length ? "cache" : "missing" },
     vat: {
