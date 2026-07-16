@@ -2396,50 +2396,50 @@ async function handleXeroPnlByCode(request: Request, env: Env): Promise<Response
   // fixes that whole class of gap, and also correctly splits partial
   // payments across the months they actually happened, rather than dumping
   // the whole invoice total into a single due-date bucket.
+  //
+  // IMPORTANT: this reads each invoice's own embedded Payments array
+  // (requires summaryOnly=false), NOT the separate global /Payments
+  // endpoint — that endpoint was returning zero records for this org for
+  // reasons that didn't show up as an HTTP error, while Invoices reliably
+  // works. Reading payments from inside the already-working Invoices call
+  // avoids the problem entirely rather than chasing why the global
+  // endpoint was empty.
   const allInvoices = await fetchXeroAllPages(
-    h, `/Invoices?where=${encodeURIComponent('Type=="ACCREC"&&(Status=="AUTHORISED"||Status=="PAID")')}&order=Date+DESC`,
+    h, `/Invoices?where=${encodeURIComponent('Type=="ACCREC"&&(Status=="AUTHORISED"||Status=="PAID")')}&order=Date+DESC&summaryOnly=false`,
     "Invoices", errors
   );
-  const invoiceById: Record<string, { total: number; totalTax: number }> = {};
-  for (const inv of allInvoices) {
-    if (inv.InvoiceID) invoiceById[inv.InvoiceID] = { total: inv.Total || 0, totalTax: inv.TotalTax || 0 };
-  }
-
-  const allPaymentsForSales = await fetchXeroAllPages(h, `/Payments?order=Date+DESC`, "Payments", errors);
-  const accrecTypeMatches = allPaymentsForSales.filter((p: any) => p.Invoice?.Type === "ACCREC" || p.Invoice?.Type === "ACCRECCREDIT");
-  const salesPaymentsThisYear = allPaymentsForSales.filter((p: any) => {
-    if (p.Status === "VOIDED") return false;
-    if (p.Invoice?.Type !== "ACCREC" && p.Invoice?.Type !== "ACCRECCREDIT") return false;
-    const d = parseXeroDateObj(p.Date);
-    return d && d >= yearStart && d <= yearEnd;
-  });
-  // Diagnostic — isolates exactly which filter stage drops real payments.
-  // Sample shape of the first payment (if any) helps spot a field-name
-  // mismatch (e.g. if p.Invoice.Type isn't actually populated as expected).
-  const salesDebug = {
-    totalPaymentsFetched: allPaymentsForSales.length,
-    accrecTypeMatches: accrecTypeMatches.length,
-    thisYearAfterAllFilters: salesPaymentsThisYear.length,
-    samplePaymentShape: allPaymentsForSales[0] ? {
-      Status: allPaymentsForSales[0].Status,
-      Date: allPaymentsForSales[0].Date,
-      Amount: allPaymentsForSales[0].Amount,
-      InvoiceType: allPaymentsForSales[0].Invoice?.Type,
-      hasInvoiceObject: !!allPaymentsForSales[0].Invoice,
-    } : null,
-  };
 
   const salesAccount = chartByCode["200"];
   let outputVat = 0;
-  for (const p of salesPaymentsThisYear) {
-    const d = parseXeroDateObj(p.Date)!;
-    const amount = p.Amount || 0;
-    const invRef = p.Invoice?.InvoiceID ? invoiceById[p.Invoice.InvoiceID] : null;
-    const taxRatio = invRef && invRef.total > 0 ? invRef.totalTax / invRef.total : 0;
-    const vatAmount = amount * taxRatio;
-    addToCode("200", salesAccount?.name || "Sales", salesAccount?.type || "REVENUE", toLocalMonth(d), amount, vatAmount);
-    outputVat += vatAmount;
+  let embeddedPaymentCount = 0;
+  for (const inv of allInvoices) {
+    const invPayments: any[] = inv.Payments || [];
+    const taxRatio = (inv.Total || 0) > 0 ? (inv.TotalTax || 0) / inv.Total : 0;
+    for (const p of invPayments) {
+      if (p.Status === "DELETED") continue;
+      const d = parseXeroDateObj(p.Date);
+      if (!d || d < yearStart || d > yearEnd) continue;
+      embeddedPaymentCount++;
+      const amount = p.Amount || 0;
+      const vatAmount = amount * taxRatio;
+      addToCode("200", salesAccount?.name || "Sales", salesAccount?.type || "REVENUE", toLocalMonth(d), amount, vatAmount);
+      outputVat += vatAmount;
+    }
   }
+  // Diagnostic — how many invoices had a Payments array at all, and how
+  // many individual payments were found within the report year.
+  const salesDebug = {
+    invoicesFetched: allInvoices.length,
+    invoicesWithPaymentsArray: allInvoices.filter((inv: any) => (inv.Payments || []).length > 0).length,
+    embeddedPaymentsThisYear: embeddedPaymentCount,
+    sampleInvoiceShape: allInvoices[0] ? {
+      Status: allInvoices[0].Status,
+      Total: allInvoices[0].Total,
+      AmountDue: allInvoices[0].AmountDue,
+      hasPaymentsArray: Array.isArray(allInvoices[0].Payments),
+      paymentsArrayLength: (allInvoices[0].Payments || []).length,
+    } : null,
+  };
 
   // Outstanding (unpaid/partially paid) invoices — no payment date exists
   // yet, so due date is the only sensible basis, treated as an ESTIMATE
