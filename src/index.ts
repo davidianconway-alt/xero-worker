@@ -612,6 +612,7 @@ export default {
     if (path === "/api/xero/bankstatement") return handleXeroBankStatement(request, env);
     if (path === "/api/xero/payments")      return handleXeroPayments(request, env);
     if (path === "/api/xero/cashflow-data") return handleXeroCashflowData(request, env);
+    if (path === "/api/xero/bank-transactions-detail") return handleXeroBankTransactionsDetail(request, env);
     if (path === "/api/xero/outgoings-debug") return handleXeroOutgoingsDebug(env);
     if (path === "/api/settings") {
       if (method === "GET")  return handleSettingsGet(env);
@@ -1792,15 +1793,14 @@ async function handleXeroCashflowData(request: Request, env: Env): Promise<Respo
   const allPayments = await fetchAllPages(`/Payments?order=Date+DESC`, "Payments");
   const allInvoices = await fetchAllPages(`/Invoices?where=${encodeURIComponent('Type=="ACCREC"&&(Status=="AUTHORISED"||Status=="PAID")')}&order=DateString+ASC`, "Invoices");
   const allBills    = await fetchAllPages(`/Invoices?where=${encodeURIComponent('Type=="ACCPAY"')}&order=Date+DESC`, "Invoices");
-  const allTx       = await fetchAllPages(`/BankTransactions?order=Date+DESC&summaryOnly=false`, "BankTransactions");
-
-  // Chart of accounts for account code → name lookup
-  const acctRes = await fetch(`${XERO_API_BASE}/Accounts`, { headers: h });
-  const acctData: any = acctRes.ok ? await acctRes.json() : { Accounts: [] };
-  const acctMap: Record<string, string> = {};
-  for (const a of acctData.Accounts || []) {
-    if (a.Code) acctMap[a.Code] = `${a.Code} — ${a.Name}`;
-  }
+  // NOTE: deliberately summary-only (no summaryOnly=false) here — this endpoint only needs
+  // monthly aggregate totals, not per-line account codes. Fetching full LineItems for every
+  // bank transaction on every cashflow-data call was the cause of the v1.31 500/1101 error
+  // (too much data, worker ran out of time/memory). Per-transaction account codes for the
+  // Outgoings Detail sheet are now served separately by /api/xero/bank-transactions-detail,
+  // which is only called on-demand when that sheet is refreshed.
+  const allTx       = await fetchAllPages(`/BankTransactions?order=Date+DESC`, "BankTransactions");
+  const acctMap: Record<string, string> = {}; // unused here now, kept for signature compatibility below
 
   // ── Payments: invoice receipts + bill payments ────────────
   const paymentsThisYear = filterYear(allPayments).filter((p: any) => p.Status !== "VOIDED");
@@ -2003,6 +2003,102 @@ async function handleXeroCashflowData(request: Request, env: Env): Promise<Respo
     },
     errors,
   };
+  await setCached(env, CACHE_KEY, result);
+  return Response.json(result, { headers: { "Access-Control-Allow-Origin": "*", "X-Cache": "MISS" } });
+}
+
+// ─── Bank transactions with account codes — on-demand, not part of the hot
+// cashflow-data path. Called only when refreshing the Xero Outgoings Detail
+// sheet (v1.31 merge). Uses summaryOnly=false to get LineItems/account codes,
+// which is why this is split out: doing this on every cashflow-data load was
+// the cause of the 500/error 1101 (too much data per request).
+async function handleXeroBankTransactionsDetail(request: Request, env: Env): Promise<Response> {
+  const CACHE_KEY = `cache_banktx_detail_${new Date().getFullYear()}`;
+  if (!wantsRefresh(request)) {
+    const cached = await getCached<any>(env, CACHE_KEY);
+    if (cached) return Response.json(cached, { headers: { "Access-Control-Allow-Origin": "*", "X-Cache": "HIT" } });
+  }
+  let tokens: XeroTokens;
+  try { tokens = await getValidTokens(env); } catch (e: any) { return new Response(e.message, { status: 401 }); }
+  const h = {
+    Authorization: `Bearer ${tokens.access_token}`,
+    "Xero-tenant-id": tokens.tenant_id,
+    Accept: "application/json",
+  };
+
+  const year      = new Date().getFullYear();
+  const yearStart = new Date(year, 0, 1);
+  const yearEnd   = new Date(year, 11, 31, 23, 59, 59);
+  const errors: string[] = [];
+
+  async function fetchAllPages(endpoint: string, key: string): Promise<any[]> {
+    let all: any[] = [];
+    let page = 1;
+    while (true) {
+      const res = await fetch(`${XERO_API_BASE}${endpoint}&page=${page}`, { headers: h });
+      if (!res.ok) {
+        const errText = await res.text();
+        errors.push(`${endpoint} page ${page}: HTTP ${res.status} — ${errText.substring(0, 100)}`);
+        break;
+      }
+      const data: any = await res.json();
+      const records = data[key] || [];
+      all = all.concat(records);
+      if (records.length < 100) break;
+      page++;
+      if (page > 30) break;
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+    return all;
+  }
+
+  // Chart of accounts — cached separately since it barely changes, saves a
+  // fetch on every call while the cache is warm.
+  const ACCT_CACHE_KEY = "cache_chart_of_accounts";
+  let acctMap = await getCached<Record<string, string>>(env, ACCT_CACHE_KEY);
+  if (!acctMap) {
+    const acctRes = await fetch(`${XERO_API_BASE}/Accounts`, { headers: h });
+    const acctData: any = acctRes.ok ? await acctRes.json() : { Accounts: [] };
+    acctMap = {};
+    for (const a of acctData.Accounts || []) {
+      if (a.Code) acctMap[a.Code] = `${a.Code} — ${a.Name}`;
+    }
+    await setCached(env, ACCT_CACHE_KEY, acctMap);
+  }
+
+  const allTx = await fetchAllPages(`/BankTransactions?order=Date+DESC&summaryOnly=false`, "BankTransactions");
+  const txThisYear = allTx.filter((tx: any) => {
+    const d = parseXeroDateObj(tx.Date);
+    return d && d >= yearStart && d <= yearEnd;
+  });
+
+  const directTransactions = txThisYear
+    .filter((tx: any) =>
+      tx.Status !== "DELETED" &&
+      (tx.Type === "SPEND" || tx.Type === "SPEND-OVERPAYMENT" ||
+       tx.Type === "RECEIVE" || tx.Type === "RECEIVE-OVERPAYMENT"))
+    .map((tx: any) => {
+      const d = parseXeroDateObj(tx.Date)!;
+      const isSpend = tx.Type === "SPEND" || tx.Type === "SPEND-OVERPAYMENT";
+      const firstLine = (tx.LineItems || [])[0];
+      const txCode = firstLine?.AccountCode || "";
+      return {
+        date:            toISO(d),
+        month:           toLocalMonth(d),
+        contact:         tx.Contact?.Name || "(no contact)",
+        type:            tx.Type,
+        reference:       tx.Reference || "",
+        amount:          tx.Total || 0,
+        totalTax:        tx.TotalTax || 0,
+        source:          isSpend ? "DirectSpend" : "DirectReceive",
+        accountCode:     txCode,
+        accountName:     (acctMap && acctMap[txCode]) || txCode,
+        lineDescription: firstLine?.Description || "",
+      };
+    })
+    .sort((a, b) => a.date.localeCompare(b.date));
+
+  const result = { directTransactions, count: directTransactions.length, errors };
   await setCached(env, CACHE_KEY, result);
   return Response.json(result, { headers: { "Access-Control-Allow-Origin": "*", "X-Cache": "MISS" } });
 }
