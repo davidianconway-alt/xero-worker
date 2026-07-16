@@ -2252,6 +2252,8 @@ async function handleXeroPnlByCode(request: Request, env: Env): Promise<Response
     for (const t of outgoingsCache.transactions) {
       const code = t.accountCode || "";
       const acct = chartByCode[code];
+      // Bills are always money going out — shown positive, matching
+      // Revenue/Expense codes' original "magnitude" convention.
       const gross = (t.amount || 0) + (t.totalTax || 0);
       addToCode(code, acct?.name || t.accountName || code, acct?.type || "", t.month, gross, t.totalTax || 0);
     }
@@ -2268,18 +2270,16 @@ async function handleXeroPnlByCode(request: Request, env: Env): Promise<Response
     directTx = bankTxCache.directTransactions;
     for (const tx of directTx) {
       const acct = chartByCode[tx.accountCode];
-      // Sign convention depends on account type, not just spend/receive:
-      // - REVENUE codes (e.g. 260 Donations Received) need income to read
-      //   POSITIVE, same as Sales (200) — so a receive (naturally negative
-      //   under spend+/receive- convention) gets flipped here.
-      // - EXPENSE/DIRECTCOSTS/OVERHEADS: spend positive/out is already the
-      //   right reading, unchanged.
-      // - Everything else (ASSET/LIABILITY/EQUITY — genuinely bidirectional
-      //   codes like Director's Loan, loan repayments) keeps the raw signed
-      //   value: spend positive/out, receive negative/in — that's the
-      //   information that makes those net correctly.
+      // Revenue-type codes (Sales, Donations) need income to read POSITIVE.
+      // Everything else keeps the original "positive = spend/magnitude"
+      // reading, EXCEPT a short explicit list of codes where receiving
+      // money should also read positive (loan proceeds etc.) — add a code
+      // here if the same issue shows up elsewhere, rather than flipping
+      // the whole report's convention again.
+      const INCOME_LIKE_CODES = ["625"]; // 625 = Loan to Vehicles For Change
       const acctType = (acct?.type || "").toUpperCase();
-      const signedAmount = acctType === "REVENUE" ? -tx.amount : tx.amount;
+      const treatAsIncome = acctType === "REVENUE" || INCOME_LIKE_CODES.includes(tx.accountCode);
+      const signedAmount = treatAsIncome ? -tx.amount : tx.amount;
       addToCode(tx.accountCode, acct?.name || tx.accountCode, acct?.type || "", tx.month, signedAmount, tx.totalTax || 0);
     }
   } else {
