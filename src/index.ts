@@ -1303,14 +1303,16 @@ async function handleXeroInvoices(request: Request, env: Env): Promise<Response>
   };
 
   const year     = new Date().getFullYear();
-  // Widened to include the prior year too — an invoice raised in December
-  // 2025 but paid (or still outstanding) in 2026 needs to be visible to
-  // Cash Movement by Account Code's payment-date recognition, not just to
-  // this endpoint's original "this year's invoices" scope. Means the Xero
-  // Invoices sheet will now also show some prior-year invoices with
-  // current-year activity — a reasonable trade-off for having one single
-  // source of truth instead of two separate fetches.
-  const fromDate = `${year - 1}-01-01`;
+  // Widened to include Q4 of the prior year — an invoice raised in
+  // December 2025 but paid (or still outstanding) in 2026 needs to be
+  // visible to Cash Movement by Account Code's payment-date recognition.
+  // Deliberately NOT the full prior year: combined with summaryOnly=false
+  // (needed for the embedded Payments array) and proper pagination, a full
+  // extra year of data pushed this past Apps Script's ~60s UrlFetchApp
+  // timeout. Straddling invoices realistically cluster near the year
+  // boundary, not throughout the whole prior year, so Q4 covers the
+  // realistic case at a fraction of the data volume.
+  const fromDate = `${year - 1}-10-01`;
   const toDate   = `${year}-12-31`;
   const errors: string[] = [];
 
