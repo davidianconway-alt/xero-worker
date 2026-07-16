@@ -325,10 +325,24 @@ async function fetchXeroAllPages(
   let all: any[] = [];
   let page = 1;
   while (true) {
-    const res = await fetch(`${XERO_API_BASE}${endpoint}&page=${page}`, { headers: h });
+    let res = await fetch(`${XERO_API_BASE}${endpoint}&page=${page}`, { headers: h });
+
+    // Rate limit — retry with backoff instead of silently giving up. A
+    // transient 429 previously meant this function returned an empty
+    // array with no error surfaced anywhere obvious, which looked exactly
+    // like "no data exists" rather than "try again in a moment".
+    let retries = 0;
+    while (res.status === 429 && retries < 3) {
+      const retryAfterHeader = res.headers.get("Retry-After");
+      const waitMs = retryAfterHeader ? parseInt(retryAfterHeader, 10) * 1000 : (retries + 1) * 2000;
+      await new Promise(resolve => setTimeout(resolve, waitMs));
+      res = await fetch(`${XERO_API_BASE}${endpoint}&page=${page}`, { headers: h });
+      retries++;
+    }
+
     if (!res.ok) {
       const errText = await res.text();
-      errors.push(`${endpoint} page ${page}: HTTP ${res.status} — ${errText.substring(0, 100)}`);
+      errors.push(`${endpoint} page ${page}: HTTP ${res.status}${retries > 0 ? ` (after ${retries} retries)` : ""} — ${errText.substring(0, 100)}`);
       break;
     }
     const data: any = await res.json();
