@@ -2237,7 +2237,7 @@ async function handleXeroBankTransactionsRaw(request: Request, env: Env): Promis
   const acctMap: Record<string, string> = {};
   for (const a of chart) acctMap[a.code] = `${a.code} — ${a.name}`;
 
-  const transactions = txThisYear.map((tx: any) => {
+  const bankTxEntries = txThisYear.map((tx: any) => {
     const d = parseXeroDateObj(tx.Date);
     const isSpend = tx.Type === "SPEND" || tx.Type === "SPEND-OVERPAYMENT";
     const isRelevantType = tx.Type === "SPEND" || tx.Type === "SPEND-OVERPAYMENT" ||
@@ -2266,18 +2266,48 @@ async function handleXeroBankTransactionsRaw(request: Request, env: Env): Promis
       isReconciled: tx.IsReconciled === true,
       accountCode: code,
       accountName: acctMap[code] || code,
+      source: "BankTransaction",
       includedInReports: excludeReason === "",
       excludeReason: excludeReason,
     };
-  }).sort((a, b) => a.date.localeCompare(b.date));
+  });
+
+  // Payments — invoice receipts and bill payments. These are the OTHER real
+  // cash movement in Xero, completely separate from BankTransactions. They
+  // don't feed Cash Movement by Account Code directly (that report reads
+  // Invoice/Bill totals, recognised by DUE DATE — not the date cash actually
+  // hit the bank), so they're flagged as such rather than "excluded" —
+  // they're real money, just recognised on a different date elsewhere.
+  const paymentEntries = paymentsThisYear.map((p: any) => {
+    const d = parseXeroDateObj(p.Date);
+    const isReceipt = p.Invoice?.Type === "ACCREC" || p.Invoice?.Type === "ACCRECCREDIT";
+    return {
+      date: d ? toISO(d) : (p.Date || ""),
+      month: d ? toLocalMonth(d) : "",
+      type: isReceipt ? "PAYMENT-RECEIVED" : "PAYMENT-MADE",
+      status: p.Status || "",
+      contact: p.Invoice?.Contact?.Name || "(no contact)",
+      reference: p.Reference || p.Invoice?.InvoiceNumber || "",
+      total: p.Amount || 0,
+      isReconciled: true,
+      accountCode: "",
+      accountName: "(invoice/bill settlement — no single account code)",
+      source: "Payment",
+      includedInReports: true,
+      excludeReason: "Feeds Cash Movement via the Invoice/Bill total, recognised by its DUE DATE — not this payment date",
+    };
+  });
+
+  const transactions = bankTxEntries.concat(paymentEntries).sort((a, b) => a.date.localeCompare(b.date));
 
   // Monthly counts/totals for both income and spend — makes an H1 gap
-  // visually obvious without needing to scroll the raw list.
+  // visually obvious without needing to scroll the raw list. Covers both
+  // BankTransactions and Payments, since both are real cash movement.
   const byMonth: Record<string, { spendCount: number; spendTotal: number; receiveCount: number; receiveTotal: number }> = {};
   for (const t of transactions) {
     if (!t.month) continue;
     if (!byMonth[t.month]) byMonth[t.month] = { spendCount: 0, spendTotal: 0, receiveCount: 0, receiveTotal: 0 };
-    const isSpend = t.type === "SPEND" || t.type === "SPEND-OVERPAYMENT";
+    const isSpend = t.type === "SPEND" || t.type === "SPEND-OVERPAYMENT" || t.type === "PAYMENT-MADE";
     if (isSpend) { byMonth[t.month].spendCount++; byMonth[t.month].spendTotal += t.total; }
     else         { byMonth[t.month].receiveCount++; byMonth[t.month].receiveTotal += t.total; }
   }
