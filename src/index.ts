@@ -1303,23 +1303,33 @@ async function handleXeroInvoices(request: Request, env: Env): Promise<Response>
   };
 
   const year     = new Date().getFullYear();
-  const fromDate = `${year}-01-01`;
+  // Widened to include the prior year too — an invoice raised in December
+  // 2025 but paid (or still outstanding) in 2026 needs to be visible to
+  // Cash Movement by Account Code's payment-date recognition, not just to
+  // this endpoint's original "this year's invoices" scope. Means the Xero
+  // Invoices sheet will now also show some prior-year invoices with
+  // current-year activity — a reasonable trade-off for having one single
+  // source of truth instead of two separate fetches.
+  const fromDate = `${year - 1}-01-01`;
   const toDate   = `${year}-12-31`;
+  const errors: string[] = [];
 
   const where = encodeURIComponent(
     `Type=="ACCREC"&&(Status=="AUTHORISED"||Status=="PAID")&&DateString>="${fromDate}"&&DateString<="${toDate}"`
   );
 
-  const res = await fetch(`${XERO_API_BASE}/Invoices?where=${where}&order=DateString+ASC`, { headers: h });
-  if (!res.ok) {
-    return new Response(await res.text(), {
-      status: res.status,
-      headers: { "Access-Control-Allow-Origin": "*" },
-    });
-  }
+  // This is the single authoritative Sales invoices fetch — other endpoints
+  // (Cash Movement by Account Code) read the cached result here rather than
+  // re-fetching live, both to avoid duplicate Xero API calls (rate limit
+  // risk) and to keep one source of truth. summaryOnly=false + proper
+  // pagination (was a single unpaginated fetch before) so the embedded
+  // Payments array is actually present and nothing gets silently truncated
+  // past 100 invoices.
+  const rawInvoices = await fetchXeroAllPages(
+    h, `/Invoices?where=${where}&order=DateString+ASC&summaryOnly=false`, "Invoices", errors
+  );
 
-  const data: any = await res.json();
-  const invoices = (data.Invoices || []).map((inv: any) => ({
+  const invoices = rawInvoices.map((inv: any) => ({
     invoiceNumber: inv.InvoiceNumber || "",
     reference:     inv.Reference || "",
     contact:       inv.Contact?.Name || "",
@@ -1332,9 +1342,14 @@ async function handleXeroInvoices(request: Request, env: Env): Promise<Response>
     total:         inv.Total      || 0,   // inc VAT
     amountDue:     inv.AmountDue  || 0,
     amountPaid:    inv.AmountPaid || 0,
+    // Embedded payments — real payment date + amount, used for cash-basis
+    // recognition elsewhere instead of a separate /Payments fetch.
+    payments: (inv.Payments || [])
+      .filter((p: any) => p.Status !== "DELETED")
+      .map((p: any) => ({ date: parseXeroDateFull(p.Date), amount: p.Amount || 0 })),
   }));
 
-  const result = { year, count: invoices.length, invoices };
+  const result = { year, count: invoices.length, invoices, errors };
   await setCached(env, CACHE_KEY, result);
   return Response.json(result, { headers: { "Access-Control-Allow-Origin": "*", "X-Cache": "MISS" } });
 }
@@ -2411,17 +2426,30 @@ async function handleXeroPnlByCode(request: Request, env: Env): Promise<Response
   // payments across the months they actually happened, rather than dumping
   // the whole invoice total into a single due-date bucket.
   //
-  // IMPORTANT: this reads each invoice's own embedded Payments array
-  // (requires summaryOnly=false), NOT the separate global /Payments
-  // endpoint — that endpoint was returning zero records for this org for
-  // reasons that didn't show up as an HTTP error, while Invoices reliably
-  // works. Reading payments from inside the already-working Invoices call
-  // avoids the problem entirely rather than chasing why the global
-  // endpoint was empty.
-  const allInvoices = await fetchXeroAllPages(
-    h, `/Invoices?where=${encodeURIComponent('Type=="ACCREC"&&(Status=="AUTHORISED"||Status=="PAID")')}&order=Date+DESC&summaryOnly=false`,
-    "Invoices", errors
-  );
+  // Reads from the cache populated by "Refresh Xero Invoices" instead of
+  // fetching live — same pattern as bills/bank transactions below, avoiding
+  // a duplicate Xero API call (this was previously its own live fetch,
+  // which was contributing to rate-limit pressure alongside everything else
+  // this endpoint used to do before that was split out).
+  const invoicesCache = await getCached<any>(env, `cache_invoices_${year}`);
+  let salesSource: "cache" | "missing" = "missing";
+  const allInvoices: any[] = [];
+  if (invoicesCache?.invoices?.length) {
+    salesSource = "cache";
+    for (const inv of invoicesCache.invoices) {
+      allInvoices.push({
+        Status: inv.status,
+        Total: inv.total,
+        TotalTax: inv.totalTax,
+        AmountDue: inv.amountDue,
+        Date: inv.date,
+        DueDate: inv.dueDate,
+        Payments: inv.payments || [],
+      });
+    }
+  } else {
+    errors.push("No cached Sales invoice data — run 'Refresh Xero Invoices' first, then refresh this report.");
+  }
 
   const salesAccount = chartByCode["200"];
   let outputVat = 0;
@@ -2430,11 +2458,10 @@ async function handleXeroPnlByCode(request: Request, env: Env): Promise<Response
     const invPayments: any[] = inv.Payments || [];
     const taxRatio = (inv.Total || 0) > 0 ? (inv.TotalTax || 0) / inv.Total : 0;
     for (const p of invPayments) {
-      if (p.Status === "DELETED") continue;
-      const d = parseXeroDateObj(p.Date);
+      const d = parseXeroDateObj(p.date);
       if (!d || d < yearStart || d > yearEnd) continue;
       embeddedPaymentCount++;
-      const amount = p.Amount || 0;
+      const amount = p.amount || 0;
       const vatAmount = amount * taxRatio;
       addToCode("200", salesAccount?.name || "Sales", salesAccount?.type || "REVENUE", toLocalMonth(d), amount, vatAmount);
       outputVat += vatAmount;
@@ -2568,7 +2595,7 @@ async function handleXeroPnlByCode(request: Request, env: Env): Promise<Response
     codes,
     salesOutstandingByMonth,
     salesDebug,
-    dataSources: { bills: billsSource, bankTransactions: bankTxCache?.directTransactions?.length ? "cache" : "missing" },
+    dataSources: { bills: billsSource, bankTransactions: bankTxCache?.directTransactions?.length ? "cache" : "missing", sales: salesSource },
     vat: {
       paidCash:           vatPaidCash,
       accruedNotPaid:      vatAccruedNotPaid,
