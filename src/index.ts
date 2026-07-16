@@ -2200,8 +2200,8 @@ async function handleXeroPnlByCode(request: Request, env: Env): Promise<Response
     byCode[key].count++;
   }
 
-  // Sales income — all ACCREC invoices. Per David: all sales income is
-  // coded to 200 Sales, so no line-item enrichment needed for invoices.
+  // Sales income — small, fast fetch (no summaryOnly=false needed since
+  // everything's coded to 200 per David's confirmed setup). Safe to do live.
   const allInvoices = await fetchXeroAllPages(
     h, `/Invoices?where=${encodeURIComponent('Type=="ACCREC"&&(Status=="AUTHORISED"||Status=="PAID")')}&order=Date+DESC`,
     "Invoices", errors
@@ -2215,34 +2215,39 @@ async function handleXeroPnlByCode(request: Request, env: Env): Promise<Response
     addToCode("200", salesAccount?.name || "Sales", salesAccount?.type || "REVENUE", inv.Total || 0, inv.TotalTax || 0);
   }
 
-  // Bills — ACCPAY, per line-item account code, gross of VAT
-  const allBills = await fetchXeroAllPages(
-    h, `/Invoices?where=${encodeURIComponent('Type=="ACCPAY"')}&order=Date+DESC&summaryOnly=false`,
-    "Invoices", errors
-  );
-  const billsThisYear = allBills.filter((b: any) => {
-    const d = parseXeroDateObj(b.Date);
-    return d && d >= yearStart && d <= yearEnd && b.Status !== "DELETED";
-  });
-  for (const bill of billsThisYear) {
-    const lineItems: any[] = bill.LineItems || [];
-    if (lineItems.length > 0) {
-      for (const line of lineItems) {
-        const code = line.AccountCode || "";
-        const acct = chartByCode[code];
-        addToCode(code, acct?.name || code, acct?.type || "", (line.LineAmount || 0) + (line.TaxAmount || 0), line.TaxAmount || 0);
-      }
-    } else {
-      addToCode("", "(no code)", "", bill.Total || 0, bill.TotalTax || 0);
+  // Bills — reuse the Xero Outgoings cache (already has per-line account
+  // codes + VAT) instead of re-fetching ACCPAY invoices with summaryOnly=false
+  // again here. Doing that fetch AND the bank transactions fetch below in the
+  // same request is what caused the 500/1101 — this endpoint now never does
+  // its own heavy Xero fetches, only cheap reads plus cached data from the
+  // other refreshes.
+  const outgoingsCache = await getCached<any>(env, `cache_outgoings_${year}`);
+  let billsSource: "cache" | "missing" = "missing";
+  if (outgoingsCache?.transactions?.length) {
+    billsSource = "cache";
+    for (const t of outgoingsCache.transactions) {
+      const code = t.accountCode || "";
+      const acct = chartByCode[code];
+      const gross = (t.amount || 0) + (t.totalTax || 0);
+      addToCode(code, acct?.name || t.accountName || code, acct?.type || "", gross, t.totalTax || 0);
     }
+  } else {
+    errors.push("No cached bills data — run 'Refresh Xero Outgoings' first, then refresh this report.");
   }
 
-  // Direct bank transactions (spend & receive), per account code — reuses
-  // the shared helper so this gets the same dedup as everywhere else.
-  const directTx = await fetchDirectBankTransactions(env, h, year, errors);
-  for (const tx of directTx) {
-    const acct = chartByCode[tx.accountCode];
-    addToCode(tx.accountCode, acct?.name || tx.accountCode, acct?.type || "", Math.abs(tx.amount), tx.totalTax || 0);
+  // Direct bank transactions — same principle: reuse the cache from
+  // bank-transactions-detail (populated by 'Refresh Xero Outgoings') instead
+  // of re-running the summaryOnly=false BankTransactions + Payments fetch here.
+  const bankTxCache = await getCached<any>(env, `cache_banktx_detail_${year}`);
+  let directTx: { accountCode: string; amount: number; totalTax: number }[] = [];
+  if (bankTxCache?.directTransactions?.length) {
+    directTx = bankTxCache.directTransactions;
+    for (const tx of directTx) {
+      const acct = chartByCode[tx.accountCode];
+      addToCode(tx.accountCode, acct?.name || tx.accountCode, acct?.type || "", Math.abs(tx.amount), tx.totalTax || 0);
+    }
+  } else {
+    errors.push("No cached bank transaction data — run 'Refresh Xero Outgoings' first, then refresh this report.");
   }
 
   // Every Revenue/Expense-type code in the chart appears even with zero
@@ -2272,7 +2277,7 @@ async function handleXeroPnlByCode(request: Request, env: Env): Promise<Response
   // his accountant isn't finalised yet, so treat this as indicative until that's
   // confirmed, not a precise HMRC-ready figure.
   const outputVat = invoicesThisYear.reduce((s: number, inv: any) => s + (inv.TotalTax || 0), 0);
-  const inputVatBills = billsThisYear.reduce((s: number, b: any) => s + (b.TotalTax || 0), 0);
+  const inputVatBills = (outgoingsCache?.transactions || []).reduce((s: number, t: any) => s + (t.totalTax || 0), 0);
   const inputVatDirect = directTx
     .filter(tx => tx.accountCode !== "820" && tx.accountCode !== "828")
     .reduce((s, tx) => s + (tx.totalTax || 0), 0);
@@ -2282,6 +2287,7 @@ async function handleXeroPnlByCode(request: Request, env: Env): Promise<Response
   const result = {
     year,
     codes,
+    dataSources: { bills: billsSource, bankTransactions: bankTxCache?.directTransactions?.length ? "cache" : "missing" },
     vat: {
       paidCash:           vatPaidCash,
       accruedNotPaid:      vatAccruedNotPaid,
