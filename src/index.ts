@@ -2406,12 +2406,28 @@ async function handleXeroPnlByCode(request: Request, env: Env): Promise<Response
   }
 
   const allPaymentsForSales = await fetchXeroAllPages(h, `/Payments?order=Date+DESC`, "Payments", errors);
+  const accrecTypeMatches = allPaymentsForSales.filter((p: any) => p.Invoice?.Type === "ACCREC" || p.Invoice?.Type === "ACCRECCREDIT");
   const salesPaymentsThisYear = allPaymentsForSales.filter((p: any) => {
     if (p.Status === "VOIDED") return false;
     if (p.Invoice?.Type !== "ACCREC" && p.Invoice?.Type !== "ACCRECCREDIT") return false;
     const d = parseXeroDateObj(p.Date);
     return d && d >= yearStart && d <= yearEnd;
   });
+  // Diagnostic — isolates exactly which filter stage drops real payments.
+  // Sample shape of the first payment (if any) helps spot a field-name
+  // mismatch (e.g. if p.Invoice.Type isn't actually populated as expected).
+  const salesDebug = {
+    totalPaymentsFetched: allPaymentsForSales.length,
+    accrecTypeMatches: accrecTypeMatches.length,
+    thisYearAfterAllFilters: salesPaymentsThisYear.length,
+    samplePaymentShape: allPaymentsForSales[0] ? {
+      Status: allPaymentsForSales[0].Status,
+      Date: allPaymentsForSales[0].Date,
+      Amount: allPaymentsForSales[0].Amount,
+      InvoiceType: allPaymentsForSales[0].Invoice?.Type,
+      hasInvoiceObject: !!allPaymentsForSales[0].Invoice,
+    } : null,
+  };
 
   const salesAccount = chartByCode["200"];
   let outputVat = 0;
@@ -2537,6 +2553,7 @@ async function handleXeroPnlByCode(request: Request, env: Env): Promise<Response
     months,
     codes,
     salesOutstandingByMonth,
+    salesDebug,
     dataSources: { bills: billsSource, bankTransactions: bankTxCache?.directTransactions?.length ? "cache" : "missing" },
     vat: {
       paidCash:           vatPaidCash,
