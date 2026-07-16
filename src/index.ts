@@ -313,6 +313,120 @@ function wantsRefresh(request: Request): boolean {
   return new URL(request.url).searchParams.get("refresh") === "true";
 }
 
+// ─── Shared Xero fetch helpers ────────────────────────────────────────────
+// Pagination, chart-of-accounts, and the payment-dedup logic used to be
+// copy-pasted into each endpoint that needed them — that's exactly how the
+// dedup logic got silently dropped when bank-transactions-detail was split
+// out. Defining them once here means every endpoint uses the same logic.
+
+async function fetchXeroAllPages(
+  h: Record<string, string>, endpoint: string, key: string, errors: string[]
+): Promise<any[]> {
+  let all: any[] = [];
+  let page = 1;
+  while (true) {
+    const res = await fetch(`${XERO_API_BASE}${endpoint}&page=${page}`, { headers: h });
+    if (!res.ok) {
+      const errText = await res.text();
+      errors.push(`${endpoint} page ${page}: HTTP ${res.status} — ${errText.substring(0, 100)}`);
+      break;
+    }
+    const data: any = await res.json();
+    const records = data[key] || [];
+    all = all.concat(records);
+    if (records.length < 100) break;
+    page++;
+    if (page > 30) break;
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
+  return all;
+}
+
+interface ChartAccount { code: string; name: string; type: string; }
+
+// Full chart of accounts (code, name, AND type — REVENUE/EXPENSE/DIRECTCOSTS/
+// OVERHEADS vs LIABILITY/ASSET/EQUITY etc). Cached since it barely changes.
+async function fetchChartOfAccounts(env: Env, h: Record<string, string>): Promise<ChartAccount[]> {
+  const CACHE_KEY = "cache_chart_of_accounts_full";
+  const cached = await getCached<ChartAccount[]>(env, CACHE_KEY);
+  if (cached) return cached;
+  const res = await fetch(`${XERO_API_BASE}/Accounts`, { headers: h });
+  const data: any = res.ok ? await res.json() : { Accounts: [] };
+  const accounts: ChartAccount[] = (data.Accounts || [])
+    .filter((a: any) => !!a.Code)
+    .map((a: any) => ({ code: a.Code, name: a.Name, type: a.Type || "" }));
+  await setCached(env, CACHE_KEY, accounts);
+  return accounts;
+}
+
+interface DirectBankTx {
+  date: string; month: string; contact: string;
+  type: string; reference: string; amount: number; // signed: spend +, receive -
+  totalTax: number; source: string;
+  accountCode: string; lineDescription: string;
+}
+
+// Direct "Spend Money"/"Receive Money" bank transactions for the year, with
+// account codes (summaryOnly=false) and deduped against Payments already
+// made against invoices/bills (a bank transaction can otherwise duplicate a
+// Payment record — see the cashflow-data 500/1101 postmortem).
+async function fetchDirectBankTransactions(
+  env: Env, h: Record<string, string>, year: number, errors: string[]
+): Promise<DirectBankTx[]> {
+  const yearStart = new Date(year, 0, 1);
+  const yearEnd   = new Date(year, 11, 31, 23, 59, 59);
+
+  const allTx = await fetchXeroAllPages(h, `/BankTransactions?order=Date+DESC&summaryOnly=false`, "BankTransactions", errors);
+  const txThisYear = allTx.filter((tx: any) => {
+    const d = parseXeroDateObj(tx.Date);
+    return d && d >= yearStart && d <= yearEnd;
+  });
+
+  const allPayments = await fetchXeroAllPages(h, `/Payments?order=Date+DESC`, "Payments", errors);
+  const paymentsThisYear = allPayments.filter((p: any) => {
+    const d = parseXeroDateObj(p.Date);
+    return d && d >= yearStart && d <= yearEnd && p.Status !== "VOIDED";
+  });
+  const billPaymentKeys    = new Set<string>();
+  const invoiceReceiptKeys = new Set<string>();
+  for (const p of paymentsThisYear) {
+    const d = parseXeroDateObj(p.Date);
+    if (!d) continue;
+    const key = `${toISO(d)}|${(p.Amount||0).toFixed(2)}`;
+    if (p.Invoice?.Type === "ACCPAY")   billPaymentKeys.add(key);
+    if (p.Invoice?.Type === "ACCREC" || p.Invoice?.Type === "ACCRECCREDIT") invoiceReceiptKeys.add(key);
+  }
+
+  return txThisYear
+    .filter((tx: any) => {
+      if (tx.Status === "DELETED") return false;
+      if (tx.Type !== "SPEND" && tx.Type !== "SPEND-OVERPAYMENT" &&
+          tx.Type !== "RECEIVE" && tx.Type !== "RECEIVE-OVERPAYMENT") return false;
+      const d = parseXeroDateObj(tx.Date);
+      if (!d) return false;
+      const isSpend = tx.Type === "SPEND" || tx.Type === "SPEND-OVERPAYMENT";
+      const key = `${toISO(d)}|${(tx.Total||0).toFixed(2)}`;
+      if (isSpend && billPaymentKeys.has(key))    return false;
+      if (!isSpend && invoiceReceiptKeys.has(key)) return false;
+      return true;
+    })
+    .map((tx: any) => {
+      const d = parseXeroDateObj(tx.Date)!;
+      const isSpend = tx.Type === "SPEND" || tx.Type === "SPEND-OVERPAYMENT";
+      const firstLine = (tx.LineItems || [])[0];
+      return {
+        date: toISO(d), month: toLocalMonth(d),
+        contact: tx.Contact?.Name || "(no contact)",
+        type: tx.Type, reference: tx.Reference || "",
+        amount: isSpend ? (tx.Total || 0) : -(tx.Total || 0),
+        totalTax: tx.TotalTax || 0,
+        source: isSpend ? "DirectSpend" : "DirectReceive",
+        accountCode: firstLine?.AccountCode || "",
+        lineDescription: firstLine?.Description || "",
+      };
+    })
+    .sort((a, b) => a.date.localeCompare(b.date));
+}
 
 async function getCostSettings(env: Env): Promise<CostSettings> {
   try {
@@ -613,6 +727,7 @@ export default {
     if (path === "/api/xero/payments")      return handleXeroPayments(request, env);
     if (path === "/api/xero/cashflow-data") return handleXeroCashflowData(request, env);
     if (path === "/api/xero/bank-transactions-detail") return handleXeroBankTransactionsDetail(request, env);
+    if (path === "/api/xero/pnl-by-code") return handleXeroPnlByCode(request, env);
     if (path === "/api/xero/outgoings-debug") return handleXeroOutgoingsDebug(env);
     if (path === "/api/settings") {
       if (method === "GET")  return handleSettingsGet(env);
@@ -2027,112 +2142,154 @@ async function handleXeroBankTransactionsDetail(request: Request, env: Env): Pro
     Accept: "application/json",
   };
 
+  const year = new Date().getFullYear();
+  const errors: string[] = [];
+
+  const chart = await fetchChartOfAccounts(env, h);
+  const acctMap: Record<string, string> = {};
+  for (const a of chart) acctMap[a.code] = `${a.code} — ${a.name}`;
+
+  const rawTx = await fetchDirectBankTransactions(env, h, year, errors);
+  const directTransactions = rawTx.map(t => ({
+    ...t,
+    accountName: acctMap[t.accountCode] || t.accountCode,
+  }));
+
+  const result = { directTransactions, count: directTransactions.length, errors };
+  await setCached(env, CACHE_KEY, result);
+  return Response.json(result, { headers: { "Access-Control-Allow-Origin": "*", "X-Cache": "MISS" } });
+}
+
+// ─── P&L by account code — gross revenue/expense totals per code, every
+// code in the chart of accounts included (not just ones with activity).
+// No budget/variance — David confirmed there isn't one to compare against.
+// VAT control accounts (820, 828) are LIABILITY type, not Expense, so they're
+// deliberately excluded from the main code list and reported separately as
+// a VAT paid/accrued split instead — otherwise they'd inflate the apparent
+// operating cost base with what's actually just VAT passing through.
+async function handleXeroPnlByCode(request: Request, env: Env): Promise<Response> {
+  const CACHE_KEY = `cache_pnl_by_code_${new Date().getFullYear()}`;
+  if (!wantsRefresh(request)) {
+    const cached = await getCached<any>(env, CACHE_KEY);
+    if (cached) return Response.json(cached, { headers: { "Access-Control-Allow-Origin": "*", "X-Cache": "HIT" } });
+  }
+  let tokens: XeroTokens;
+  try { tokens = await getValidTokens(env); } catch (e: any) { return new Response(e.message, { status: 401 }); }
+  const h = {
+    Authorization: `Bearer ${tokens.access_token}`,
+    "Xero-tenant-id": tokens.tenant_id,
+    Accept: "application/json",
+  };
+
   const year      = new Date().getFullYear();
   const yearStart = new Date(year, 0, 1);
   const yearEnd   = new Date(year, 11, 31, 23, 59, 59);
   const errors: string[] = [];
 
-  async function fetchAllPages(endpoint: string, key: string): Promise<any[]> {
-    let all: any[] = [];
-    let page = 1;
-    while (true) {
-      const res = await fetch(`${XERO_API_BASE}${endpoint}&page=${page}`, { headers: h });
-      if (!res.ok) {
-        const errText = await res.text();
-        errors.push(`${endpoint} page ${page}: HTTP ${res.status} — ${errText.substring(0, 100)}`);
-        break;
-      }
-      const data: any = await res.json();
-      const records = data[key] || [];
-      all = all.concat(records);
-      if (records.length < 100) break;
-      page++;
-      if (page > 30) break;
-      await new Promise(resolve => setTimeout(resolve, 500));
-    }
-    return all;
+  const chart = await fetchChartOfAccounts(env, h);
+  const chartByCode: Record<string, ChartAccount> = {};
+  for (const a of chart) chartByCode[a.code] = a;
+
+  interface CodeTotal { code: string; name: string; type: string; gross: number; vat: number; count: number; }
+  const byCode: Record<string, CodeTotal> = {};
+  function addToCode(code: string, name: string, type: string, gross: number, vat: number) {
+    const key = code || "(no code)";
+    if (!byCode[key]) byCode[key] = { code: key, name: name || key, type, gross: 0, vat: 0, count: 0 };
+    byCode[key].gross += gross;
+    byCode[key].vat   += vat;
+    byCode[key].count++;
   }
 
-  // Chart of accounts — cached separately since it barely changes, saves a
-  // fetch on every call while the cache is warm.
-  const ACCT_CACHE_KEY = "cache_chart_of_accounts";
-  let acctMap = await getCached<Record<string, string>>(env, ACCT_CACHE_KEY);
-  if (!acctMap) {
-    const acctRes = await fetch(`${XERO_API_BASE}/Accounts`, { headers: h });
-    const acctData: any = acctRes.ok ? await acctRes.json() : { Accounts: [] };
-    acctMap = {};
-    for (const a of acctData.Accounts || []) {
-      if (a.Code) acctMap[a.Code] = `${a.Code} — ${a.Name}`;
-    }
-    await setCached(env, ACCT_CACHE_KEY, acctMap);
-  }
-
-  const allTx = await fetchAllPages(`/BankTransactions?order=Date+DESC&summaryOnly=false`, "BankTransactions");
-  const txThisYear = allTx.filter((tx: any) => {
-    const d = parseXeroDateObj(tx.Date);
+  // Sales income — all ACCREC invoices. Per David: all sales income is
+  // coded to 200 Sales, so no line-item enrichment needed for invoices.
+  const allInvoices = await fetchXeroAllPages(
+    h, `/Invoices?where=${encodeURIComponent('Type=="ACCREC"&&(Status=="AUTHORISED"||Status=="PAID")')}&order=Date+DESC`,
+    "Invoices", errors
+  );
+  const invoicesThisYear = allInvoices.filter((inv: any) => {
+    const d = parseXeroDateObj(inv.Date);
     return d && d >= yearStart && d <= yearEnd;
   });
-
-  // Same dedup as cashflow-data: a "Receive Money"/"Spend Money" bank
-  // transaction can duplicate a Payment already made against an invoice/bill
-  // (e.g. an overpayment, or a receipt later applied to an invoice). Without
-  // this, those show up twice — once via the Invoices/Bills tab and again
-  // here as a DirectSpend/DirectReceive row.
-  const allPayments = await fetchAllPages(`/Payments?order=Date+DESC`, "Payments");
-  const paymentsThisYear = allPayments.filter((p: any) => {
-    const d = parseXeroDateObj(p.Date);
-    return d && d >= yearStart && d <= yearEnd && p.Status !== "VOIDED";
-  });
-  const billPaymentKeys    = new Set<string>();
-  const invoiceReceiptKeys = new Set<string>();
-  for (const p of paymentsThisYear) {
-    const d = parseXeroDateObj(p.Date);
-    if (!d) continue;
-    const key = `${toISO(d)}|${(p.Amount||0).toFixed(2)}`;
-    if (p.Invoice?.Type === "ACCPAY")   billPaymentKeys.add(key);
-    if (p.Invoice?.Type === "ACCREC" || p.Invoice?.Type === "ACCRECCREDIT") invoiceReceiptKeys.add(key);
+  const salesAccount = chartByCode["200"];
+  for (const inv of invoicesThisYear) {
+    addToCode("200", salesAccount?.name || "Sales", salesAccount?.type || "REVENUE", inv.Total || 0, inv.TotalTax || 0);
   }
 
-  const directTransactions = txThisYear
-    .filter((tx: any) => {
-      if (tx.Status === "DELETED") return false;
-      if (tx.Type !== "SPEND" && tx.Type !== "SPEND-OVERPAYMENT" &&
-          tx.Type !== "RECEIVE" && tx.Type !== "RECEIVE-OVERPAYMENT") return false;
-      const d = parseXeroDateObj(tx.Date);
-      if (!d) return false;
-      const isSpend = tx.Type === "SPEND" || tx.Type === "SPEND-OVERPAYMENT";
-      const key = `${toISO(d)}|${(tx.Total||0).toFixed(2)}`;
-      if (isSpend && billPaymentKeys.has(key))    return false;
-      if (!isSpend && invoiceReceiptKeys.has(key)) return false;
-      return true;
-    })
-    .map((tx: any) => {
-      const d = parseXeroDateObj(tx.Date)!;
-      const isSpend = tx.Type === "SPEND" || tx.Type === "SPEND-OVERPAYMENT";
-      const firstLine = (tx.LineItems || [])[0];
-      const txCode = firstLine?.AccountCode || "";
-      // Signed so a SUM() over the sheet nets correctly: money out is
-      // positive, money in (e.g. donations) is negative — standard
-      // outgoings-ledger convention, and makes receipts visually distinct
-      // from spend even without relying on the Source column or colour.
-      const signedAmount = isSpend ? (tx.Total || 0) : -(tx.Total || 0);
-      return {
-        date:            toISO(d),
-        month:           toLocalMonth(d),
-        contact:         tx.Contact?.Name || "(no contact)",
-        type:            tx.Type,
-        reference:       tx.Reference || "",
-        amount:          signedAmount,
-        totalTax:        tx.TotalTax || 0,
-        source:          isSpend ? "DirectSpend" : "DirectReceive",
-        accountCode:     txCode,
-        accountName:     (acctMap && acctMap[txCode]) || txCode,
-        lineDescription: firstLine?.Description || "",
-      };
-    })
-    .sort((a, b) => a.date.localeCompare(b.date));
+  // Bills — ACCPAY, per line-item account code, gross of VAT
+  const allBills = await fetchXeroAllPages(
+    h, `/Invoices?where=${encodeURIComponent('Type=="ACCPAY"')}&order=Date+DESC&summaryOnly=false`,
+    "Invoices", errors
+  );
+  const billsThisYear = allBills.filter((b: any) => {
+    const d = parseXeroDateObj(b.Date);
+    return d && d >= yearStart && d <= yearEnd && b.Status !== "DELETED";
+  });
+  for (const bill of billsThisYear) {
+    const lineItems: any[] = bill.LineItems || [];
+    if (lineItems.length > 0) {
+      for (const line of lineItems) {
+        const code = line.AccountCode || "";
+        const acct = chartByCode[code];
+        addToCode(code, acct?.name || code, acct?.type || "", (line.LineAmount || 0) + (line.TaxAmount || 0), line.TaxAmount || 0);
+      }
+    } else {
+      addToCode("", "(no code)", "", bill.Total || 0, bill.TotalTax || 0);
+    }
+  }
 
-  const result = { directTransactions, count: directTransactions.length, errors };
+  // Direct bank transactions (spend & receive), per account code — reuses
+  // the shared helper so this gets the same dedup as everywhere else.
+  const directTx = await fetchDirectBankTransactions(env, h, year, errors);
+  for (const tx of directTx) {
+    const acct = chartByCode[tx.accountCode];
+    addToCode(tx.accountCode, acct?.name || tx.accountCode, acct?.type || "", Math.abs(tx.amount), tx.totalTax || 0);
+  }
+
+  // Every Revenue/Expense-type code in the chart appears even with zero
+  // activity — that's the whole point of "all cost codes", not just used ones.
+  for (const a of chart) {
+    const t = (a.type || "").toUpperCase();
+    if (t !== "REVENUE" && t !== "EXPENSE" && t !== "DIRECTCOSTS" && t !== "OVERHEADS") continue;
+    if (!byCode[a.code]) byCode[a.code] = { code: a.code, name: a.name, type: a.type, gross: 0, vat: 0, count: 0 };
+  }
+
+  const codes = Object.values(byCode)
+    .filter(c => {
+      const t = (c.type || "").toUpperCase();
+      return t === "REVENUE" || t === "EXPENSE" || t === "DIRECTCOSTS" || t === "OVERHEADS";
+    })
+    .sort((a, b) => a.code.localeCompare(b.code));
+
+  // ── VAT — paid (cash, codes 820+828) vs accrued for the rest of the year ──
+  const vatPaidCash = directTx
+    .filter(tx => tx.accountCode === "820" || tx.accountCode === "828")
+    .reduce((sum, tx) => sum + tx.amount, 0); // signed: spend positive
+
+  // Full-year accrual-basis estimate: Output VAT (on sales) minus Input VAT
+  // (on bills + direct spend, excluding the 820/828 payments themselves).
+  // This is an APPROXIMATION — it uses invoice/bill dates, not payment dates.
+  // David's confirmed his actual VAT scheme (cash vs accrual accounting) with
+  // his accountant isn't finalised yet, so treat this as indicative until that's
+  // confirmed, not a precise HMRC-ready figure.
+  const outputVat = invoicesThisYear.reduce((s: number, inv: any) => s + (inv.TotalTax || 0), 0);
+  const inputVatBills = billsThisYear.reduce((s: number, b: any) => s + (b.TotalTax || 0), 0);
+  const inputVatDirect = directTx
+    .filter(tx => tx.accountCode !== "820" && tx.accountCode !== "828")
+    .reduce((s, tx) => s + (tx.totalTax || 0), 0);
+  const totalYearVatLiability = outputVat - inputVatBills - inputVatDirect;
+  const vatAccruedNotPaid = totalYearVatLiability - vatPaidCash;
+
+  const result = {
+    year,
+    codes,
+    vat: {
+      paidCash:           vatPaidCash,
+      accruedNotPaid:      vatAccruedNotPaid,
+      totalYearLiability:  totalYearVatLiability,
+      note: "Accrued figure = Output VAT minus Input VAT on an accrual (invoice/bill date) basis — indicative pending confirmation of your actual VAT scheme (cash vs accrual) from your accountant.",
+    },
+    errors,
+  };
   await setCached(env, CACHE_KEY, result);
   return Response.json(result, { headers: { "Access-Control-Allow-Origin": "*", "X-Cache": "MISS" } });
 }
