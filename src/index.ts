@@ -2219,17 +2219,23 @@ async function handleXeroPnlByCode(request: Request, env: Env): Promise<Response
 
   // Sales income — small, fast fetch (no summaryOnly=false needed since
   // everything's coded to 200 per David's confirmed setup). Safe to do live.
+  // Bucketed by DUE DATE, not date raised — per David: he wants revenue
+  // landing in the month it's due, not the month the invoice was issued.
+  // Falls back to Date raised only if an invoice has no DueDate set.
   const allInvoices = await fetchXeroAllPages(
     h, `/Invoices?where=${encodeURIComponent('Type=="ACCREC"&&(Status=="AUTHORISED"||Status=="PAID")')}&order=Date+DESC`,
     "Invoices", errors
   );
+  function invoiceRecognitionDate(inv: any): Date | null {
+    return parseXeroDateObj(inv.DueDate) || parseXeroDateObj(inv.Date);
+  }
   const invoicesThisYear = allInvoices.filter((inv: any) => {
-    const d = parseXeroDateObj(inv.Date);
+    const d = invoiceRecognitionDate(inv);
     return d && d >= yearStart && d <= yearEnd;
   });
   const salesAccount = chartByCode["200"];
   for (const inv of invoicesThisYear) {
-    const d = parseXeroDateObj(inv.Date)!;
+    const d = invoiceRecognitionDate(inv)!;
     addToCode("200", salesAccount?.name || "Sales", salesAccount?.type || "REVENUE", toLocalMonth(d), inv.Total || 0, inv.TotalTax || 0);
   }
 
