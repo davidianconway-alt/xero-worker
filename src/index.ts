@@ -1305,7 +1305,7 @@ async function handleXeroOutgoings(request: Request, env: Env): Promise<Response
   interface OutgoingTxn {
     date: string; month: string; contact: string;
     type: string; reference: string; invoiceNumber: string;
-    amount: number; status: string; source: string;
+    amount: number; totalTax: number; status: string; source: string;
     accountCode: string; accountName: string; lineDescription: string;
   }
   const transactions: OutgoingTxn[] = [];
@@ -1321,6 +1321,7 @@ async function handleXeroOutgoings(request: Request, env: Env): Promise<Response
           type: "Bill", reference: bill.Reference || "",
           invoiceNumber: bill.InvoiceNumber || "",
           amount: line.LineAmount || 0,
+          totalTax: line.TaxAmount || 0,
           status: bill.Status || "",
           source: "Bill",
           accountCode: code,
@@ -1334,7 +1335,7 @@ async function handleXeroOutgoings(request: Request, env: Env): Promise<Response
         contact: bill.Contact?.Name || "(no contact)",
         type: "Bill", reference: bill.Reference || "",
         invoiceNumber: bill.InvoiceNumber || "",
-        amount: bill.Total || 0, status: bill.Status || "",
+        amount: bill.SubTotal || 0, totalTax: bill.TotalTax || 0, status: bill.Status || "",
         source: "Bill", accountCode: "", accountName: "", lineDescription: "",
       });
     }
@@ -2072,23 +2073,56 @@ async function handleXeroBankTransactionsDetail(request: Request, env: Env): Pro
     return d && d >= yearStart && d <= yearEnd;
   });
 
+  // Same dedup as cashflow-data: a "Receive Money"/"Spend Money" bank
+  // transaction can duplicate a Payment already made against an invoice/bill
+  // (e.g. an overpayment, or a receipt later applied to an invoice). Without
+  // this, those show up twice — once via the Invoices/Bills tab and again
+  // here as a DirectSpend/DirectReceive row.
+  const allPayments = await fetchAllPages(`/Payments?order=Date+DESC`, "Payments");
+  const paymentsThisYear = allPayments.filter((p: any) => {
+    const d = parseXeroDateObj(p.Date);
+    return d && d >= yearStart && d <= yearEnd && p.Status !== "VOIDED";
+  });
+  const billPaymentKeys    = new Set<string>();
+  const invoiceReceiptKeys = new Set<string>();
+  for (const p of paymentsThisYear) {
+    const d = parseXeroDateObj(p.Date);
+    if (!d) continue;
+    const key = `${toISO(d)}|${(p.Amount||0).toFixed(2)}`;
+    if (p.Invoice?.Type === "ACCPAY")   billPaymentKeys.add(key);
+    if (p.Invoice?.Type === "ACCREC" || p.Invoice?.Type === "ACCRECCREDIT") invoiceReceiptKeys.add(key);
+  }
+
   const directTransactions = txThisYear
-    .filter((tx: any) =>
-      tx.Status !== "DELETED" &&
-      (tx.Type === "SPEND" || tx.Type === "SPEND-OVERPAYMENT" ||
-       tx.Type === "RECEIVE" || tx.Type === "RECEIVE-OVERPAYMENT"))
+    .filter((tx: any) => {
+      if (tx.Status === "DELETED") return false;
+      if (tx.Type !== "SPEND" && tx.Type !== "SPEND-OVERPAYMENT" &&
+          tx.Type !== "RECEIVE" && tx.Type !== "RECEIVE-OVERPAYMENT") return false;
+      const d = parseXeroDateObj(tx.Date);
+      if (!d) return false;
+      const isSpend = tx.Type === "SPEND" || tx.Type === "SPEND-OVERPAYMENT";
+      const key = `${toISO(d)}|${(tx.Total||0).toFixed(2)}`;
+      if (isSpend && billPaymentKeys.has(key))    return false;
+      if (!isSpend && invoiceReceiptKeys.has(key)) return false;
+      return true;
+    })
     .map((tx: any) => {
       const d = parseXeroDateObj(tx.Date)!;
       const isSpend = tx.Type === "SPEND" || tx.Type === "SPEND-OVERPAYMENT";
       const firstLine = (tx.LineItems || [])[0];
       const txCode = firstLine?.AccountCode || "";
+      // Signed so a SUM() over the sheet nets correctly: money out is
+      // positive, money in (e.g. donations) is negative — standard
+      // outgoings-ledger convention, and makes receipts visually distinct
+      // from spend even without relying on the Source column or colour.
+      const signedAmount = isSpend ? (tx.Total || 0) : -(tx.Total || 0);
       return {
         date:            toISO(d),
         month:           toLocalMonth(d),
         contact:         tx.Contact?.Name || "(no contact)",
         type:            tx.Type,
         reference:       tx.Reference || "",
-        amount:          tx.Total || 0,
+        amount:          signedAmount,
         totalTax:        tx.TotalTax || 0,
         source:          isSpend ? "DirectSpend" : "DirectReceive",
         accountCode:     txCode,
