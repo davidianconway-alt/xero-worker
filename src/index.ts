@@ -2389,26 +2389,57 @@ async function handleXeroPnlByCode(request: Request, env: Env): Promise<Response
     byCode[key].count++;
   }
 
-  // Sales income — small, fast fetch (no summaryOnly=false needed since
-  // everything's coded to 200 per David's confirmed setup). Safe to do live.
-  // Bucketed by DUE DATE, not date raised — per David: he wants revenue
-  // landing in the month it's due, not the month the invoice was issued.
-  // Falls back to Date raised only if an invoice has no DueDate set.
+  // Sales income — recognised by ACTUAL PAYMENT DATE, not invoice due date.
+  // An invoice due in one year but paid in another (e.g. due Sep 2025, paid
+  // Jan 2026) was invisible under due-date recognition — it fell into 2025's
+  // window even though the cash landed in 2026. Payment-date recognition
+  // fixes that whole class of gap, and also correctly splits partial
+  // payments across the months they actually happened, rather than dumping
+  // the whole invoice total into a single due-date bucket.
   const allInvoices = await fetchXeroAllPages(
     h, `/Invoices?where=${encodeURIComponent('Type=="ACCREC"&&(Status=="AUTHORISED"||Status=="PAID")')}&order=Date+DESC`,
     "Invoices", errors
   );
-  function invoiceRecognitionDate(inv: any): Date | null {
-    return parseXeroDateObj(inv.DueDate) || parseXeroDateObj(inv.Date);
+  const invoiceById: Record<string, { total: number; totalTax: number }> = {};
+  for (const inv of allInvoices) {
+    if (inv.InvoiceID) invoiceById[inv.InvoiceID] = { total: inv.Total || 0, totalTax: inv.TotalTax || 0 };
   }
-  const invoicesThisYear = allInvoices.filter((inv: any) => {
-    const d = invoiceRecognitionDate(inv);
+
+  const allPaymentsForSales = await fetchXeroAllPages(h, `/Payments?order=Date+DESC`, "Payments", errors);
+  const salesPaymentsThisYear = allPaymentsForSales.filter((p: any) => {
+    if (p.Status === "VOIDED") return false;
+    if (p.Invoice?.Type !== "ACCREC" && p.Invoice?.Type !== "ACCRECCREDIT") return false;
+    const d = parseXeroDateObj(p.Date);
     return d && d >= yearStart && d <= yearEnd;
   });
+
   const salesAccount = chartByCode["200"];
-  for (const inv of invoicesThisYear) {
-    const d = invoiceRecognitionDate(inv)!;
-    addToCode("200", salesAccount?.name || "Sales", salesAccount?.type || "REVENUE", toLocalMonth(d), inv.Total || 0, inv.TotalTax || 0);
+  let outputVat = 0;
+  for (const p of salesPaymentsThisYear) {
+    const d = parseXeroDateObj(p.Date)!;
+    const amount = p.Amount || 0;
+    const invRef = p.Invoice?.InvoiceID ? invoiceById[p.Invoice.InvoiceID] : null;
+    const taxRatio = invRef && invRef.total > 0 ? invRef.totalTax / invRef.total : 0;
+    const vatAmount = amount * taxRatio;
+    addToCode("200", salesAccount?.name || "Sales", salesAccount?.type || "REVENUE", toLocalMonth(d), amount, vatAmount);
+    outputVat += vatAmount;
+  }
+
+  // Outstanding (unpaid/partially paid) invoices — no payment date exists
+  // yet, so due date is the only sensible basis, treated as an ESTIMATE
+  // rather than an actual. Returned separately (not folded into the actuals
+  // above) so Code.gs can run it through the same estimate/manual-override
+  // machinery already used for recurring cost projections — same yellow-
+  // italic treatment, same "manual edit always wins" behaviour.
+  const salesOutstandingByMonth: Record<string, number> = {};
+  for (const inv of allInvoices) {
+    if (inv.Status !== "AUTHORISED") continue; // PAID invoices have AmountDue=0 anyway, but skip explicitly for clarity
+    const amountDue = inv.AmountDue || 0;
+    if (amountDue <= 0) continue;
+    const d = parseXeroDateObj(inv.DueDate) || parseXeroDateObj(inv.Date);
+    if (!d) continue;
+    const m = toLocalMonth(d);
+    salesOutstandingByMonth[m] = (salesOutstandingByMonth[m] || 0) + amountDue;
   }
 
   // Bills — reuse the Xero Outgoings cache (already has per-line account
@@ -2487,13 +2518,13 @@ async function handleXeroPnlByCode(request: Request, env: Env): Promise<Response
     .filter(tx => tx.accountCode === "820" || tx.accountCode === "828")
     .reduce((sum, tx) => sum + tx.amount, 0); // signed: spend positive
 
-  // Full-year accrual-basis estimate: Output VAT (on sales) minus Input VAT
-  // (on bills + direct spend, excluding the 820/828 payments themselves).
-  // This is an APPROXIMATION — it uses invoice/bill dates, not payment dates.
-  // David's confirmed his actual VAT scheme (cash vs accrual accounting) with
-  // his accountant isn't finalised yet, so treat this as indicative until that's
-  // confirmed, not a precise HMRC-ready figure.
-  const outputVat = invoicesThisYear.reduce((s: number, inv: any) => s + (inv.TotalTax || 0), 0);
+  // Full-year cash-basis estimate: Output VAT (on sales payments actually
+  // received this year — computed above alongside Sales recognition) minus
+  // Input VAT (on bills + direct spend, excluding the 820/828 payments
+  // themselves). Using payment dates throughout (not invoice/bill dates) is
+  // more consistent with actual cash accounting VAT, though David's actual
+  // VAT scheme with his accountant isn't finalised yet, so still treat this
+  // as indicative, not a precise HMRC-ready figure.
   const inputVatBills = (outgoingsCache?.transactions || []).reduce((s: number, t: any) => s + (t.totalTax || 0), 0);
   const inputVatDirect = directTx
     .filter(tx => tx.accountCode !== "820" && tx.accountCode !== "828")
@@ -2505,12 +2536,13 @@ async function handleXeroPnlByCode(request: Request, env: Env): Promise<Response
     year,
     months,
     codes,
+    salesOutstandingByMonth,
     dataSources: { bills: billsSource, bankTransactions: bankTxCache?.directTransactions?.length ? "cache" : "missing" },
     vat: {
       paidCash:           vatPaidCash,
       accruedNotPaid:      vatAccruedNotPaid,
       totalYearLiability:  totalYearVatLiability,
-      note: "Accrued figure = Output VAT minus Input VAT on an accrual (invoice/bill date) basis — indicative pending confirmation of your actual VAT scheme (cash vs accrual) from your accountant.",
+      note: "Accrued figure = Output VAT (on sales payments received) minus Input VAT (on bills/spend) — output side is payment-date/cash-basis, input side uses bill/transaction dates. Indicative pending confirmation of your actual VAT scheme (cash vs accrual) from your accountant.",
     },
     errors,
   };
