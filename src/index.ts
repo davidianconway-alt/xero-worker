@@ -728,6 +728,7 @@ export default {
     if (path === "/api/xero/cashflow-data") return handleXeroCashflowData(request, env);
     if (path === "/api/xero/bank-transactions-detail") return handleXeroBankTransactionsDetail(request, env);
     if (path === "/api/xero/pnl-by-code") return handleXeroPnlByCode(request, env);
+    if (path === "/api/xero/bank-transactions-raw") return handleXeroBankTransactionsRaw(request, env);
     if (path === "/api/xero/outgoings-debug") return handleXeroOutgoingsDebug(env);
     if (path === "/api/settings") {
       if (method === "GET")  return handleSettingsGet(env);
@@ -2158,6 +2159,147 @@ async function handleXeroBankTransactionsDetail(request: Request, env: Env): Pro
   const result = { directTransactions, count: directTransactions.length, errors };
   await setCached(env, CACHE_KEY, result);
   return Response.json(result, { headers: { "Access-Control-Allow-Origin": "*", "X-Cache": "MISS" } });
+}
+
+// ─── Diagnostic: raw bank transactions, unfiltered ───────────────────────────
+// Unlike fetchDirectBankTransactions (which excludes anything matching a
+// Payment, to avoid double-counting), this returns EVERY bank transaction
+// for the year with a reason shown for why it would/wouldn't appear in the
+// P&L-style reports — built specifically to track down "income missing from
+// H1" type discrepancies against Xero's own bank balance. Also reports
+// pagination diagnostics, since BankTransactions is fetched newest-first
+// and capped at 30 pages (3000 records) as a safety valve — if a year has
+// more transactions than that, the OLDEST months (H1) are exactly what
+// would silently go missing.
+async function handleXeroBankTransactionsRaw(request: Request, env: Env): Promise<Response> {
+  let tokens: XeroTokens;
+  try { tokens = await getValidTokens(env); } catch (e: any) { return new Response(e.message, { status: 401 }); }
+  const h = {
+    Authorization: `Bearer ${tokens.access_token}`,
+    "Xero-tenant-id": tokens.tenant_id,
+    Accept: "application/json",
+  };
+
+  const year      = new Date().getFullYear();
+  const yearStart = new Date(year, 0, 1);
+  const yearEnd   = new Date(year, 11, 31, 23, 59, 59);
+  const errors: string[] = [];
+
+  // Fetch with page-by-page tracking so we know if the cap was hit.
+  let pageCount = 0;
+  let allTx: any[] = [];
+  {
+    let page = 1;
+    while (true) {
+      const res = await fetch(`${XERO_API_BASE}/BankTransactions?order=Date+DESC&summaryOnly=false&page=${page}`, { headers: h });
+      if (!res.ok) {
+        const errText = await res.text();
+        errors.push(`BankTransactions page ${page}: HTTP ${res.status} — ${errText.substring(0, 100)}`);
+        break;
+      }
+      const data: any = await res.json();
+      const records = data.BankTransactions || [];
+      allTx = allTx.concat(records);
+      pageCount = page;
+      if (records.length < 100) break;
+      page++;
+      if (page > 30) break;
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+  }
+  const hitPageCap = pageCount >= 30;
+
+  const allDates = allTx.map((tx: any) => parseXeroDateObj(tx.Date)).filter((d): d is Date => !!d);
+  const earliestFetched = allDates.length ? new Date(Math.min(...allDates.map(d => d.getTime()))) : null;
+  const latestFetched   = allDates.length ? new Date(Math.max(...allDates.map(d => d.getTime()))) : null;
+
+  const txThisYear = allTx.filter((tx: any) => {
+    const d = parseXeroDateObj(tx.Date);
+    return d && d >= yearStart && d <= yearEnd;
+  });
+
+  const allPayments = await fetchXeroAllPages(h, `/Payments?order=Date+DESC`, "Payments", errors);
+  const paymentsThisYear = allPayments.filter((p: any) => {
+    const d = parseXeroDateObj(p.Date);
+    return d && d >= yearStart && d <= yearEnd && p.Status !== "VOIDED";
+  });
+  const billPaymentKeys    = new Set<string>();
+  const invoiceReceiptKeys = new Set<string>();
+  for (const p of paymentsThisYear) {
+    const d = parseXeroDateObj(p.Date);
+    if (!d) continue;
+    const key = `${toISO(d)}|${(p.Amount||0).toFixed(2)}`;
+    if (p.Invoice?.Type === "ACCPAY")   billPaymentKeys.add(key);
+    if (p.Invoice?.Type === "ACCREC" || p.Invoice?.Type === "ACCRECCREDIT") invoiceReceiptKeys.add(key);
+  }
+
+  const chart = await fetchChartOfAccounts(env, h);
+  const acctMap: Record<string, string> = {};
+  for (const a of chart) acctMap[a.code] = `${a.code} — ${a.name}`;
+
+  const transactions = txThisYear.map((tx: any) => {
+    const d = parseXeroDateObj(tx.Date);
+    const isSpend = tx.Type === "SPEND" || tx.Type === "SPEND-OVERPAYMENT";
+    const isRelevantType = tx.Type === "SPEND" || tx.Type === "SPEND-OVERPAYMENT" ||
+                            tx.Type === "RECEIVE" || tx.Type === "RECEIVE-OVERPAYMENT";
+    const firstLine = (tx.LineItems || [])[0];
+    const code = firstLine?.AccountCode || "";
+
+    let excludeReason = "";
+    if (tx.Status === "DELETED") excludeReason = "Status DELETED";
+    else if (!isRelevantType) excludeReason = "Type not SPEND/RECEIVE (" + tx.Type + ")";
+    else if (!d) excludeReason = "Unparseable date";
+    else {
+      const key = `${toISO(d)}|${(tx.Total||0).toFixed(2)}`;
+      if (isSpend && billPaymentKeys.has(key)) excludeReason = "Matches a Payment against a bill (deduped)";
+      if (!isSpend && invoiceReceiptKeys.has(key)) excludeReason = "Matches a Payment against an invoice (deduped)";
+    }
+
+    return {
+      date: d ? toISO(d) : (tx.Date || ""),
+      month: d ? toLocalMonth(d) : "",
+      type: tx.Type || "",
+      status: tx.Status || "",
+      contact: tx.Contact?.Name || "(no contact)",
+      reference: tx.Reference || "",
+      total: tx.Total || 0,
+      isReconciled: tx.IsReconciled === true,
+      accountCode: code,
+      accountName: acctMap[code] || code,
+      includedInReports: excludeReason === "",
+      excludeReason: excludeReason,
+    };
+  }).sort((a, b) => a.date.localeCompare(b.date));
+
+  // Monthly counts/totals for both income and spend — makes an H1 gap
+  // visually obvious without needing to scroll the raw list.
+  const byMonth: Record<string, { spendCount: number; spendTotal: number; receiveCount: number; receiveTotal: number }> = {};
+  for (const t of transactions) {
+    if (!t.month) continue;
+    if (!byMonth[t.month]) byMonth[t.month] = { spendCount: 0, spendTotal: 0, receiveCount: 0, receiveTotal: 0 };
+    const isSpend = t.type === "SPEND" || t.type === "SPEND-OVERPAYMENT";
+    if (isSpend) { byMonth[t.month].spendCount++; byMonth[t.month].spendTotal += t.total; }
+    else         { byMonth[t.month].receiveCount++; byMonth[t.month].receiveTotal += t.total; }
+  }
+
+  const result = {
+    year,
+    diagnostics: {
+      pagesFetched: pageCount,
+      totalRecordsFetchedAllTime: allTx.length, // before year filter — every BankTransaction Xero returned
+      hitPageCap,
+      earliestDateFetched: earliestFetched ? toISO(earliestFetched) : null,
+      latestDateFetched: latestFetched ? toISO(latestFetched) : null,
+      warning: hitPageCap
+        ? "Pagination hit the 30-page safety cap — older transactions (likely early in the year) may be missing. Fetched date range shown above; if it doesn't reach back to 1 Jan, that's the cause."
+        : null,
+    },
+    transactionCount: transactions.length,
+    byMonth: Object.fromEntries(Object.entries(byMonth).sort()),
+    transactions,
+    errors,
+  };
+  return Response.json(result, { headers: { "Access-Control-Allow-Origin": "*" } });
 }
 
 // ─── P&L by account code — gross revenue/expense totals per code, every
