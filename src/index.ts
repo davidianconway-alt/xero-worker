@@ -2533,14 +2533,17 @@ async function handleXeroPnlByCode(request: Request, env: Env): Promise<Response
     for (const tx of directTx) {
       const acct = chartByCode[tx.accountCode];
       // Revenue-type codes (Sales, Donations) need income to read POSITIVE.
-      // Everything else keeps the original "positive = spend/magnitude"
-      // reading, EXCEPT a short explicit list of codes where receiving
-      // money should also read positive (loan proceeds etc.) — add a code
-      // here if the same issue shows up elsewhere, rather than flipping
-      // the whole report's convention again.
-      const INCOME_LIKE_CODES = ["625"]; // 625 = Loan to Vehicles For Change
+      // Every other code — including capital/loan/receivable codes like 625
+      // Loan to Vehicles For Change, 910 HP Loan, 835 Director's Loan —
+      // reads consistently: spend positive, receive negative, matching the
+      // native Outgoings Detail convention. A prior one-off exception for
+      // 625 specifically was dropped: it made that single code read
+      // opposite to every other capital/loan code with no way to tell why
+      // from the sheet alone — inconsistent in a document meant to be
+      // independently verified. The underlying totals were correct either
+      // way; this only affects which direction that one row reads.
       const acctType = (acct?.type || "").toUpperCase();
-      const treatAsIncome = acctType === "REVENUE" || INCOME_LIKE_CODES.includes(tx.accountCode);
+      const treatAsIncome = acctType === "REVENUE";
       const signedAmount = treatAsIncome ? -tx.amount : tx.amount;
       addToCode(tx.accountCode, acct?.name || tx.accountCode, acct?.type || "", tx.month, signedAmount, tx.totalTax || 0);
     }
