@@ -742,6 +742,7 @@ export default {
     if (path === "/api/xero/cashflow-data") return handleXeroCashflowData(request, env);
     if (path === "/api/xero/bank-transactions-detail") return handleXeroBankTransactionsDetail(request, env);
     if (path === "/api/xero/pnl-by-code") return handleXeroPnlByCode(request, env);
+    if (path === "/api/xero/chart-of-accounts") return handleXeroChartOfAccounts(request, env);
     if (path === "/api/xero/bank-transactions-raw") return handleXeroBankTransactionsRaw(request, env);
     if (path === "/api/xero/outgoings-debug") return handleXeroOutgoingsDebug(env);
     if (path === "/api/settings") {
@@ -2370,6 +2371,35 @@ async function handleXeroBankTransactionsRaw(request: Request, env: Env): Promis
 // deliberately excluded from the main code list and reported separately as
 // a VAT paid/accrued split instead — otherwise they'd inflate the apparent
 // operating cost base with what's actually just VAT passing through.
+// ─── Chart of accounts — lightweight, standalone. Populates the "Xero
+// Account Codes" sheet so Cash Movement by Account Code can build its row
+// list and type classification (Revenue/Expense/Asset/Liability etc)
+// straight from a visible sheet, rather than calling the Worker for it on
+// every refresh. Chart of accounts barely changes, so this only needs
+// refreshing occasionally, not as part of the hot path.
+async function handleXeroChartOfAccounts(request: Request, env: Env): Promise<Response> {
+  let tokens: XeroTokens;
+  try { tokens = await getValidTokens(env); } catch (e: any) { return new Response(e.message, { status: 401 }); }
+  const h = {
+    Authorization: `Bearer ${tokens.access_token}`,
+    "Xero-tenant-id": tokens.tenant_id,
+    Accept: "application/json",
+  };
+  const chart = wantsRefresh(request)
+    ? await (async () => {
+        const res = await fetch(`${XERO_API_BASE}/Accounts`, { headers: h });
+        const data: any = res.ok ? await res.json() : { Accounts: [] };
+        const accounts: ChartAccount[] = (data.Accounts || [])
+          .filter((a: any) => !!a.Code)
+          .map((a: any) => ({ code: a.Code, name: a.Name, type: a.Type || "" }));
+        await setCached(env, "cache_chart_of_accounts_full", accounts);
+        return accounts;
+      })()
+    : await fetchChartOfAccounts(env, h);
+
+  return Response.json({ codes: chart }, { headers: { "Access-Control-Allow-Origin": "*" } });
+}
+
 async function handleXeroPnlByCode(request: Request, env: Env): Promise<Response> {
   const CACHE_KEY = `cache_pnl_by_code_${new Date().getFullYear()}`;
   if (!wantsRefresh(request)) {
@@ -2576,8 +2606,20 @@ async function handleXeroPnlByCode(request: Request, env: Env): Promise<Response
     .sort((a, b) => a.code.localeCompare(b.code));
 
   // ── VAT — paid (cash, codes 820+828) vs accrued for the rest of the year ──
+  // January 820 payments are excluded on purpose: UK VAT is due one month
+  // and seven days after quarter-end, so a payment landing in January
+  // always settles the PRIOR year's final quarter (Sep-Nov), not anything
+  // from this year's own trading. Without this, that payment would
+  // artificially inflate "this year's VAT paid" and understate what's
+  // still genuinely owed for the current year. This is a general rule
+  // (any January 820 payment, any year), not a one-off fix for a specific
+  // transaction, since the same timing repeats every year. Doesn't apply
+  // to 828 — that's a separate TTP instalment plan (see below), not tied
+  // to the quarterly cycle. David has confirmed VAT scheme timing isn't
+  // otherwise known well enough to do anything more precise than this.
   const vatPaidCash = directTx
     .filter(tx => tx.accountCode === "820" || tx.accountCode === "828")
+    .filter(tx => !(tx.accountCode === "820" && tx.month === `${year}-01`))
     .reduce((sum, tx) => sum + tx.amount, 0); // signed: spend positive
 
   // Full-year cash-basis estimate: Output VAT (on sales payments actually
@@ -2605,7 +2647,7 @@ async function handleXeroPnlByCode(request: Request, env: Env): Promise<Response
       paidCash:           vatPaidCash,
       accruedNotPaid:      vatAccruedNotPaid,
       totalYearLiability:  totalYearVatLiability,
-      note: "Accrued figure = Output VAT (on sales payments received) minus Input VAT (on bills/spend) — output side is payment-date/cash-basis, input side uses bill/transaction dates. Indicative pending confirmation of your actual VAT scheme (cash vs accrual) from your accountant.",
+      note: "Accrued figure = Output VAT (on sales payments received) minus Input VAT (on bills/spend) — output side is payment-date/cash-basis, input side uses bill/transaction dates. VAT paid (cash) excludes any January 820 payment, since that always settles the prior year's final quarter, not this year's own liability. Indicative pending confirmation of your actual VAT scheme (cash vs accrual) from your accountant.",
     },
     errors,
   };
