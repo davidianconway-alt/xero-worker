@@ -2605,7 +2605,7 @@ async function handleXeroPnlByCode(request: Request, env: Env): Promise<Response
     .filter(c => !VAT_CONTROL_CODES.includes(c.code))
     .sort((a, b) => a.code.localeCompare(b.code));
 
-  // ── VAT — paid (cash, codes 820+828) vs accrued for the rest of the year ──
+  // ── VAT — paid (cash, code 820 only) vs accrued for the rest of the year ──
   // January 820 payments are excluded on purpose: UK VAT is due one month
   // and seven days after quarter-end, so a payment landing in January
   // always settles the PRIOR year's final quarter (Sep-Nov), not anything
@@ -2613,22 +2613,27 @@ async function handleXeroPnlByCode(request: Request, env: Env): Promise<Response
   // artificially inflate "this year's VAT paid" and understate what's
   // still genuinely owed for the current year. This is a general rule
   // (any January 820 payment, any year), not a one-off fix for a specific
-  // transaction, since the same timing repeats every year. Doesn't apply
-  // to 828 — that's a separate TTP instalment plan (see below), not tied
-  // to the quarterly cycle. David has confirmed VAT scheme timing isn't
-  // otherwise known well enough to do anything more precise than this.
+  // transaction, since the same timing repeats every year.
+  //
+  // 828 is deliberately EXCLUDED from this whole calculation — David has
+  // confirmed it's a separate TTP (Time To Pay) instalment plan for a
+  // historical error correction, completely unrelated to routine quarterly
+  // VAT. It still appears as a normal row in the main table (contributing
+  // to Net Cash Movement/Running Balance like any other cost), it just no
+  // longer gets blended into the VAT paid/accrued reconciliation below.
   const vatPaidCash = directTx
-    .filter(tx => tx.accountCode === "820" || tx.accountCode === "828")
-    .filter(tx => !(tx.accountCode === "820" && tx.month === `${year}-01`))
+    .filter(tx => tx.accountCode === "820")
+    .filter(tx => tx.month !== `${year}-01`)
     .reduce((sum, tx) => sum + tx.amount, 0); // signed: spend positive
 
   // Full-year cash-basis estimate: Output VAT (on sales payments actually
   // received this year — computed above alongside Sales recognition) minus
-  // Input VAT (on bills + direct spend, excluding the 820/828 payments
-  // themselves). Using payment dates throughout (not invoice/bill dates) is
-  // more consistent with actual cash accounting VAT, though David's actual
-  // VAT scheme with his accountant isn't finalised yet, so still treat this
-  // as indicative, not a precise HMRC-ready figure.
+  // Input VAT (on bills + direct spend, excluding 820 AND 828 — 828 for the
+  // reason above, 820 since it's the VAT control account itself). Using
+  // payment dates throughout (not invoice/bill dates) is more consistent
+  // with actual cash accounting VAT, though David's actual VAT scheme with
+  // his accountant isn't finalised yet, so still treat this as indicative,
+  // not a precise HMRC-ready figure.
   const inputVatBills = (outgoingsCache?.transactions || []).reduce((s: number, t: any) => s + (t.totalTax || 0), 0);
   const inputVatDirect = directTx
     .filter(tx => tx.accountCode !== "820" && tx.accountCode !== "828")
@@ -2647,7 +2652,7 @@ async function handleXeroPnlByCode(request: Request, env: Env): Promise<Response
       paidCash:           vatPaidCash,
       accruedNotPaid:      vatAccruedNotPaid,
       totalYearLiability:  totalYearVatLiability,
-      note: "Accrued figure = Output VAT (on sales payments received) minus Input VAT (on bills/spend) — output side is payment-date/cash-basis, input side uses bill/transaction dates. VAT paid (cash) excludes any January 820 payment, since that always settles the prior year's final quarter, not this year's own liability. Indicative pending confirmation of your actual VAT scheme (cash vs accrual) from your accountant.",
+      note: "Accrued figure = Output VAT (on sales payments received) minus Input VAT (on bills/spend) — output side is payment-date/cash-basis, input side uses bill/transaction dates. VAT paid (cash) is code 820 only, and excludes any January payment (settles the prior year's final quarter). 828 is excluded entirely — a separate TTP instalment plan for a historical error, unrelated to routine VAT (it still appears as a normal row in the main table). Indicative pending confirmation of your actual VAT scheme (cash vs accrual) from your accountant.",
     },
     errors,
   };
