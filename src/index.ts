@@ -2600,7 +2600,7 @@ async function handleXeroPnlByCode(request: Request, env: Env): Promise<Response
     }
   }
 
-  const VAT_CONTROL_CODES = ["820", "828"]; // handled separately below — never in the main list
+  const VAT_CONTROL_CODES = ["820"]; // 828 now appears as a normal row (regular payment out) — only 820 stays excluded, still separate below
   const codes = Object.values(byCode)
     .filter(c => !VAT_CONTROL_CODES.includes(c.code))
     .sort((a, b) => a.code.localeCompare(b.code));
